@@ -1,0 +1,21 @@
+# 构建产物
+bin/
+obj/
+out/
+dist/
+wwwroot/
+
+# 依赖
+node_modules/
+
+# 大文件（模型需单独获取：HF Xenova/clip-vit-base-patch32 onnx/vision_model.onnx）
+models/
+
+# 运行时状态（点选/向量/评分/配置，随机器走）
+backend/data/
+
+# 管线生成物
+pipeline/data/
+.idea/
+.vscode/
+*.user

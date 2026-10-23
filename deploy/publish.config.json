@@ -1,0 +1,26 @@
+{
+  "$schema": "发布配置：bun publish.mjs 按此文件组装发布包",
+  "dataRoot": "../",
+  "runtimes": ["osx-arm64", "win-x64"],
+  "frontend": {
+    "buildCmd": "bun run build",
+    "dist": "../frontend/dist"
+  },
+  "backend": {
+    "project": "../backend/IconPicker.Api.csproj",
+    "data": "backend/data",
+    "models": "backend/models"
+  },
+  "package": {
+    "outDir": "out",
+    "dataRootName": "data-root",
+    "includeDataFiles": [
+      "backend/data/config.json",
+      "backend/data/picks.json",
+      "backend/data/vectors.json",
+      "backend/data/visual-results.json"
+    ],
+    "includeModels": true,
+    "iconDirsFromConfig": true
+  }
+}
