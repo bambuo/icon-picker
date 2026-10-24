@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using IconPicker.Api;
 using SkiaSharp;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,32 +30,37 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-// 数据根：DATA_ROOT env > appsettings DataRoot > 开发机目录（存在才用）> exe 相对 data-root
-var root = Environment.GetEnvironmentVariable("DATA_ROOT")
-    ?? app.Configuration["DataRoot"]
-    ?? (Directory.Exists("/Users/johana/Desktop/新图标") ? "/Users/johana/Desktop/新图标" : Path.Combine(AppContext.BaseDirectory, "data-root"));
-var dataDir = Path.Combine(app.Environment.ContentRootPath, "data");
+var dataDir = Environment.GetEnvironmentVariable("DATA_DIR") ?? Path.Combine(app.Environment.ContentRootPath, "data");
 var vecPath = Path.Combine(dataDir, "vectors.json");
 var picksPath = Path.Combine(dataDir, "picks.json");
 var configPath = Path.Combine(dataDir, "config.json");
 var resultsPath = Path.Combine(dataDir, "visual-results.json");
+OcrService.Configure(dataDir);
+
+const string DefaultModelUrl = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model.onnx";
+const string DefaultOcrModelUrl = "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.10.0/onnx/PP-OCRv5";
 
 // ---------- config ----------
+// 不做任何预置：目录/前缀都由用户在工作台里配置；无配置也能启动（界面空数据）
 var config = new Config();
 if (File.Exists(configPath))
 {
-    config = JsonSerializer.Deserialize<Config>(File.ReadAllText(configPath), JsonOpt()) ?? config;
+    var node = JsonNode.Parse(File.ReadAllText(configPath)) as JsonObject ?? new JsonObject();
+    // 旧字段迁移：realXxx → liveXxx（线上现图改名）
+    var migrated = false;
+    foreach (var (oldKey, newKey) in new[] { ("realDirs", "liveDirs"), ("realPrefixes", "livePrefixes"), ("realPathPattern", "livePathPattern") })
+        if (node[oldKey] is { } v && node[newKey] is null) { node.Remove(oldKey); node[newKey] = v.DeepClone(); migrated = true; }
+    config = node.Deserialize<Config>(JsonOpt()) ?? config;
+    if (migrated) SaveConfig();
 }
 else
-{
-    config.CandidateDirs.Add(Path.Combine(root, "未使用图标"));
-    config.RealDirs.Add(Path.Combine(root, "真实图标-ppcabt"));
-    config.RealDirs.Add(Path.Combine(root, "真实图标"));
-    config.RealPrefixes.Add(new PrefixItem("https://static.ppcabt.com", "ppcabt"));
-    config.RealPrefixes.Add(new PrefixItem("https://statictest.image-oss.online", "statictest"));
-    config.DefaultPrefixIndex = 0;
     SaveConfig();
-}
+if (string.IsNullOrWhiteSpace(config.ModelUrl)) config.ModelUrl = DefaultModelUrl;
+if (string.IsNullOrWhiteSpace(config.OcrModelUrl)) config.OcrModelUrl = DefaultOcrModelUrl;
+if (string.IsNullOrWhiteSpace(config.OcrModel)) config.OcrModel = "latin";
+// 发布包内的 config 用相对 DATA_ROOT 的目录名，启动时统一解析为绝对路径
+config.CandidateDirs = config.CandidateDirs.Where(d => !string.IsNullOrWhiteSpace(d)).Select(NormDir).Distinct().ToList();
+config.LiveDirs = config.LiveDirs.Where(d => !string.IsNullOrWhiteSpace(d)).Select(NormDir).Distinct().ToList();
 void SaveConfig() { Directory.CreateDirectory(dataDir); File.WriteAllText(configPath, JsonSerializer.Serialize(config, JsonOpt(true))); }
 JsonSerializerOptions JsonOpt(bool indented = false) => new()
 {
@@ -64,129 +70,28 @@ JsonSerializerOptions JsonOpt(bool indented = false) => new()
     Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
 };
 
-// ---------- 我方模板映射（code → 相对路径 / 名称 / 厅室） ----------
-var templateIcon = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-var templateMeta = new Dictionary<string, (string Name, string Hall)>(StringComparer.OrdinalIgnoreCase);
-string PtName(string raw)
+// ---------- 线上现图完整路径规则：{code} 替换为游戏编码；用于按前缀远程取图 ----------
+string LivePathOf(string code)
 {
-    try
-    {
-        using var d = JsonDocument.Parse(raw);
-        return d.RootElement.TryGetProperty("pt", out var v) ? v.GetString() ?? "" : "";
-    }
-    catch { return raw ?? ""; }
-}
-foreach (var f in Directory.EnumerateFiles(root, "t_game_template_*.json"))
-{
-    try
-    {
-        using var doc = JsonDocument.Parse(File.ReadAllText(f));
-        foreach (var e in doc.RootElement.GetProperty("t_game_template").EnumerateArray())
-        {
-            var code = e.GetProperty("game_code").GetString();
-            if (string.IsNullOrEmpty(code)) continue;
-            var icon = e.TryGetProperty("default_icon", out var di) ? di.GetString() : null;
-            if (!string.IsNullOrEmpty(icon)) templateIcon.TryAdd(code, icon);
-            templateMeta.TryAdd(code, (PtName(e.GetProperty("game_name").GetString() ?? ""), e.GetProperty("hall_code").GetString() ?? ""));
-        }
-    }
-    catch { /* 忽略损坏的模板快照 */ }
-}
-string IconPathOf(string code) =>
-    templateIcon.TryGetValue(code, out var p) ? p : $"/fec/game/icon/long/{Path.GetFileName(code)}.jpg";
-
-// ---------- aa123 候选元数据（basename → 名称/厂商） ----------
-var aaMeta = new Dictionary<string, (string Name, string Group)>(StringComparer.OrdinalIgnoreCase);
-// aa123 与数据根为兄弟目录（…/Desktop/{新图标,aa123}），两级探测
-var aaPath = new[] { Path.Combine(root, "aa123", "games.json"), Path.Combine(Path.GetDirectoryName(root) ?? "", "aa123", "games.json") }.FirstOrDefault(File.Exists) ?? "";
-if (File.Exists(aaPath))
-{
-    try
-    {
-        using var doc = JsonDocument.Parse(File.ReadAllText(aaPath));
-        var arr = doc.RootElement.ValueKind == JsonValueKind.Array
-            ? doc.RootElement
-            : doc.RootElement.GetProperty("games");
-        foreach (var e in arr.EnumerateArray())
-        {
-            var baseName = Path.GetFileName(e.GetProperty("icon_file").GetString() ?? "");
-            if (baseName.Length == 0) continue;
-            aaMeta.TryAdd(baseName, (e.GetProperty("game_name").GetString() ?? "", e.GetProperty("group_name").GetString() ?? ""));
-        }
-    }
-    catch { /* 忽略损坏快照 */ }
-}
-
-// ---------- 已采用集合（可选台账 CSV；无则不做排除） ----------
-static List<string> ParseCsvLine(string line)
-{
-    var row = new List<string>(); var sb = new StringBuilder(); var q = false;
-    for (var i = 0; i < line.Length; i++)
-    {
-        var c = line[i];
-        if (q)
-        {
-            if (c == '"') { if (i + 1 < line.Length && line[i + 1] == '"') { sb.Append('"'); i++; } else q = false; }
-            else sb.Append(c);
-        }
-        else if (c == '"') q = true;
-        else if (c == ',') { row.Add(sb.ToString()); sb.Clear(); }
-        else sb.Append(c);
-    }
-    row.Add(sb.ToString());
-    return row;
-}
-var adoptedCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-var adoptedSources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-var adoptedCsv = Path.Combine(root, "已采用图标清单.csv");
-if (File.Exists(adoptedCsv))
-{
-    try
-    {
-        var lines = File.ReadAllLines(adoptedCsv);
-        if (lines.Length > 1)
-        {
-            var head = ParseCsvLine(lines[0]);
-            var iCode = head.IndexOf("game_code");
-            var iSrc = head.IndexOf("aa123源图标");
-            foreach (var line in lines.Skip(1))
-            {
-                if (line.Length == 0) continue;
-                var row = ParseCsvLine(line);
-                if (iCode >= 0 && iCode < row.Count) adoptedCodes.Add(row[iCode]);
-                if (iSrc >= 0 && iSrc < row.Count) adoptedSources.Add(Path.GetFileName(row[iSrc]));
-            }
-        }
-    }
-    catch { /* 台账损坏时不做排除 */ }
-}
-
-// ---------- OCR 语料（basename → 文本） ----------
-var ocrMap = new Dictionary<string, string>();
-var ocrDir = Path.Combine(root, "icon-picker", "pipeline", "data", "ocr");
-if (Directory.Exists(ocrDir))
-{
-    foreach (var f in Directory.EnumerateFiles(ocrDir, "*.jsonl"))
-    {
-        try
-        {
-            foreach (var line in File.ReadLines(f))
-            {
-                if (line.Length == 0) continue;
-                using var doc = JsonDocument.Parse(line);
-                var file = doc.RootElement.GetProperty("file").GetString() ?? "";
-                var text = doc.RootElement.TryGetProperty("text", out var t) ? t.GetString() : null;
-                ocrMap[Path.GetFileName(file)] = text ?? "";
-            }
-        }
-        catch { /* 忽略损坏行 */ }
-    }
+    var pattern = string.IsNullOrWhiteSpace(config.LivePathPattern) ? "long/{code}.jpg" : config.LivePathPattern;
+    return pattern.Replace("{code}", Path.GetFileName(code), StringComparison.OrdinalIgnoreCase);
 }
 
 // ---------- 数据与点选 ----------
-JsonElement data = JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(resultsPath));
+// 发布包不带评分结果：首次启动先给空结果，自检算完再热更新
+const string EmptyResults = """{"high":0.75,"mid":0.62,"sameImg":0.78,"poolCount":0,"results":[]}""";
+var resultsRaw = File.Exists(resultsPath) ? File.ReadAllText(resultsPath) : EmptyResults;
+// 旧评分快照字段迁移：hasReal → hasLive
+if (resultsRaw.Contains("\"hasReal\""))
+{
+    resultsRaw = resultsRaw.Replace("\"hasReal\"", "\"hasLive\"");
+    try { File.WriteAllText(resultsPath, resultsRaw); } catch { /* 快照只读时忽略 */ }
+}
+JsonElement data = JsonDocument.Parse(resultsRaw).RootElement.Clone();
 JsonElement games = data.GetProperty("results");
 var gameByCode = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+foreach (var g in games.EnumerateArray())
+    gameByCode[g.GetProperty("code").GetString()!] = g;
 void LoadScoring(string json)
 {
     data = JsonDocument.Parse(json).RootElement.Clone();
@@ -195,7 +100,6 @@ void LoadScoring(string json)
     foreach (var g in games.EnumerateArray())
         gameByCode[g.GetProperty("code").GetString()!] = g;
 }
-LoadScoring(File.ReadAllText(resultsPath));
 
 Dictionary<string, string> LoadPicks() =>
     File.Exists(picksPath)
@@ -219,23 +123,41 @@ app.MapPut("/api/config", async (HttpRequest req) =>
 {
     var incoming = await JsonSerializer.DeserializeAsync<Config>(req.Body, JsonOpt());
     if (incoming is null) return J(new { error = "bad config" }, 400);
-    if (incoming.CandidateDirs.Count == 0) return J(new { error = "候选图目录不能为空" }, 400);
-    incoming.RealPrefixes = incoming.RealPrefixes
+    // 允许空配置：目录与前缀都由用户按需添加
+    incoming.LivePrefixes = incoming.LivePrefixes
         .Where(p => !string.IsNullOrWhiteSpace(p.Url))
         .Select(p => new PrefixItem(p.Url.Trim().TrimEnd('/'), string.IsNullOrWhiteSpace(p.Name) ? "未命名" : p.Name.Trim()))
         .DistinctBy(p => p.Url)
         .ToList();
-    if (incoming.RealPrefixes.Count == 0) return J(new { error = "至少保留一个真实图前缀" }, 400);
-    if (incoming.DefaultPrefixIndex < 0 || incoming.DefaultPrefixIndex >= incoming.RealPrefixes.Count)
+    if (incoming.DefaultPrefixIndex < 0 || incoming.DefaultPrefixIndex >= incoming.LivePrefixes.Count)
         incoming.DefaultPrefixIndex = 0;
+    incoming.LivePathPattern = string.IsNullOrWhiteSpace(incoming.LivePathPattern)
+        ? "long/{code}.jpg" : incoming.LivePathPattern.Trim();
+    if (!incoming.LivePathPattern.Contains("{code}", StringComparison.OrdinalIgnoreCase))
+        return J(new { error = "线上现图路径规则需包含 {code} 占位符" }, 400);
+    if (string.IsNullOrWhiteSpace(incoming.ModelUrl)) incoming.ModelUrl = DefaultModelUrl;
+    incoming.ModelUrl = incoming.ModelUrl.Trim();
+    if (!incoming.ModelUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        return J(new { error = "模型下载地址需以 http(s):// 开头" }, 400);
+    if (string.IsNullOrWhiteSpace(incoming.OcrModelUrl)) incoming.OcrModelUrl = DefaultOcrModelUrl;
+    incoming.OcrModelUrl = incoming.OcrModelUrl.Trim();
+    if (!incoming.OcrModelUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        return J(new { error = "OCR 模型地址需以 http(s):// 开头" }, 400);
+    incoming.OcrModelPreset = OcrService.PresetKeys.Contains(incoming.OcrModelPreset ?? "", StringComparer.OrdinalIgnoreCase)
+        ? incoming.OcrModelPreset!.ToLowerInvariant() : "latin";
+    incoming.OcrModel = (incoming.OcrModel ?? "").Trim();
+    if (incoming.OcrModel.Length == 0) incoming.OcrModel = "latin";
+    if (!incoming.OcrModel.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+        && !OcrService.PresetKeys.Contains(incoming.OcrModel, StringComparer.OrdinalIgnoreCase))
+        incoming.OcrModel = "latin";
     // 目录地址原样持久化（允许先配置后建目录）；使用端按需跳过不存在的目录
-    incoming.CandidateDirs = incoming.CandidateDirs.Select(NormDir).Distinct().ToList();
-    incoming.RealDirs = incoming.RealDirs.Select(NormDir).Distinct().ToList();
+    incoming.CandidateDirs = incoming.CandidateDirs.Where(d => !string.IsNullOrWhiteSpace(d)).Select(NormDir).Distinct().ToList();
+    incoming.LiveDirs = incoming.LiveDirs.Where(d => !string.IsNullOrWhiteSpace(d)).Select(NormDir).Distinct().ToList();
     config = incoming;
     SaveConfig();
     return J(config);
 });
-string NormDir(string p) => Path.TrimEndingDirectorySeparator(Path.IsPathRooted(p) ? Path.GetFullPath(p) : Path.GetFullPath(Path.Combine(root, p)));
+string NormDir(string p) => Path.TrimEndingDirectorySeparator(Path.IsPathRooted(p) ? Path.GetFullPath(p) : Path.GetFullPath(Path.Combine(dataDir, p)));
 
 app.MapGet("/api/picks", () => J(LoadPicks()));
 app.MapPut("/api/picks/{code}", async (string code, HttpRequest req) =>
@@ -266,7 +188,11 @@ static int VectorCount(string path)
     try { return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(path))?.Count ?? 0; }
     catch { return 0; }
 }
-var modelPath = Path.Combine(app.Environment.ContentRootPath, "models", "vision_model.onnx");
+// 模型放运行期数据目录（发布包不再携带）；开发机旧位置只读兜底
+var modelPath = Path.Combine(dataDir, "models", "vision_model.onnx");
+var bundledModelPath = Path.Combine(app.Environment.ContentRootPath, "models", "vision_model.onnx");
+if (!File.Exists(modelPath) && File.Exists(bundledModelPath)) modelPath = bundledModelPath;
+var modelDl = new ModelDownloadState();
 
 app.MapGet("/api/embed/status", () => J(new
 {
@@ -278,29 +204,163 @@ app.MapGet("/api/embed/status", () => J(new
     ClipEmbedding.FinishedAt,
     modelExists = File.Exists(modelPath),
     vectors = File.Exists(vecPath) ? VectorCount(vecPath) : 0,
+    updatedAt = File.Exists(vecPath) ? File.GetLastWriteTime(vecPath) : (DateTime?)null,
 }));
 
 app.MapPost("/api/embed/rebuild", (HttpRequest req) =>
 {
-    if (!File.Exists(modelPath)) return J(new { error = "模型缺失：backend/models/vision_model.onnx" }, 400);
+    if (!File.Exists(modelPath)) return J(new { error = "模型缺失：请先在「配置 → 图像向量」下载模型" }, 400);
     if (ClipEmbedding.Running) return J(new { error = "重建已在进行中" }, 409);
     var force = bool.TryParse(req.Query["force"].ToString(), out var f) && f;
-    Task.Run(() => ClipEmbedding.Rebuild(root, modelPath, force));
+    Task.Run(() => ClipEmbedding.Rebuild(dataDir, modelPath, force));
     return J(new { started = true, force });
 });
+
+app.MapPost("/api/model/download", async (HttpRequest req) =>
+{
+    if (modelDl.Running) return J(new { error = "模型下载已在进行中" }, 409);
+    string? url = null;
+    try
+    {
+        using var doc = await JsonDocument.ParseAsync(req.Body);
+        if (doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("url", out var u))
+            url = u.GetString();
+    }
+    catch { /* 无 body 时用配置值 */ }
+    if (!string.IsNullOrWhiteSpace(url)) config.ModelUrl = url.Trim();
+    if (string.IsNullOrWhiteSpace(config.ModelUrl)) config.ModelUrl = DefaultModelUrl;
+    if (!config.ModelUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        return J(new { error = "模型下载地址需以 http(s):// 开头" }, 400);
+
+    var theUrl = config.ModelUrl;
+    Task.Run(async () =>
+    {
+        modelDl.Running = true; modelDl.Done = 0; modelDl.Total = 0; modelDl.Error = null;
+        modelDl.StartedAt = DateTime.Now; modelDl.FinishedAt = null;
+        var dest = Path.Combine(dataDir, "models", "vision_model.onnx");
+        var tmp = dest + ".tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+            using var resp = await http.GetAsync(theUrl, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            modelDl.Total = resp.Content.Headers.ContentLength ?? 0;
+            await using (var src = await resp.Content.ReadAsStreamAsync())
+            await using (var fs = File.Create(tmp))
+            {
+                var buf = new byte[128 * 1024];
+                int n;
+                while ((n = await src.ReadAsync(buf)) > 0)
+                {
+                    await fs.WriteAsync(buf.AsMemory(0, n));
+                    modelDl.Done += n;
+                }
+            }
+            File.Move(tmp, dest, true);
+            modelPath = dest;
+            modelDl.FinishedAt = DateTime.Now;
+        }
+        catch (Exception ex)
+        {
+            modelDl.Error = ex.Message;
+            try { File.Delete(tmp); } catch { }
+        }
+        finally { modelDl.Running = false; }
+    });
+    return J(new { started = true, url = theUrl });
+});
+
+app.MapGet("/api/model/status", () => J(new
+{
+    modelDl.Running, modelDl.Done, modelDl.Total, modelDl.Error, modelDl.StartedAt, modelDl.FinishedAt,
+    modelExists = File.Exists(modelPath), modelPath, url = config.ModelUrl,
+}));
+
+app.MapPost("/api/ocr/rebuild", (HttpRequest req) =>
+{
+    if (OcrService.Running) return J(new { error = "OCR 已在进行中" }, 409);
+    var force = bool.TryParse(req.Query["force"].ToString(), out var f) && f;
+    Task.Run(() => OcrService.Rebuild(
+        [.. config.LiveDirs, .. config.CandidateDirs], dataDir, force));
+    return J(new { started = true, force });
+});
+
+app.MapGet("/api/ocr/status", () =>
+{
+    var cache = OcrService.CachePath(dataDir);
+    return J(new
+    {
+        OcrService.Running, OcrService.Done, OcrService.Total, OcrService.Error,
+        OcrService.StartedAt, OcrService.FinishedAt,
+        count = OcrService.LoadCache(dataDir).Count,
+        updatedAt = File.Exists(cache) ? File.GetLastWriteTime(cache) : (DateTime?)null,
+    });
+});
+
+app.MapPost("/api/ocr/model/download", async (HttpRequest req) =>
+{
+    if (OcrService.Downloading) return J(new { error = "OCR 模型下载已在进行中" }, 409);
+    string? url = null; string? preset = null; string? model = null;
+    try
+    {
+        using var doc = await JsonDocument.ParseAsync(req.Body);
+        if (doc.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            if (doc.RootElement.TryGetProperty("url", out var u)) url = u.GetString();
+            if (doc.RootElement.TryGetProperty("preset", out var p)) preset = p.GetString();
+            if (doc.RootElement.TryGetProperty("model", out var m)) model = m.GetString();
+        }
+    }
+    catch { /* 无 body 时用配置值 */ }
+    if (!string.IsNullOrWhiteSpace(url)) config.OcrModelUrl = url.Trim();
+    if (!string.IsNullOrWhiteSpace(preset)) config.OcrModelPreset = preset.Trim();
+    if (!string.IsNullOrWhiteSpace(model)) config.OcrModel = model.Trim();
+    if (string.IsNullOrWhiteSpace(config.OcrModel)) config.OcrModel = config.OcrModelPreset;
+    if (string.IsNullOrWhiteSpace(config.OcrModelUrl)) config.OcrModelUrl = DefaultOcrModelUrl;
+
+    var isCustomUrl = config.OcrModel.StartsWith("http", StringComparison.OrdinalIgnoreCase);
+    if (isCustomUrl)
+    {
+        if (!Uri.TryCreate(config.OcrModel, UriKind.Absolute, out var parsed)
+            || (parsed.Scheme != "http" && parsed.Scheme != "https"))
+            return J(new { error = "OCR 模型地址需以 http(s):// 开头" }, 400);
+    }
+
+    var theUrl = isCustomUrl ? config.OcrModel : config.OcrModelUrl;
+    var thePreset = isCustomUrl ? "latin"
+        : (OcrService.PresetKeys.Contains(config.OcrModel, StringComparer.OrdinalIgnoreCase) ? config.OcrModel.ToLowerInvariant() : "latin");
+    Task.Run(() => OcrService.DownloadModels(theUrl, thePreset, dataDir));
+    return J(new { started = true, url = theUrl, preset = thePreset, model = config.OcrModel });
+});
+
+app.MapGet("/api/ocr/model/status", () => J(new
+{
+    OcrService.Downloading, OcrService.DlDone, OcrService.DlTotal, OcrService.DlError,
+    OcrService.DlStartedAt, OcrService.DlFinishedAt,
+    modelReady = OcrService.ModelsReady(dataDir),
+    dir = OcrService.ActiveModelDir(dataDir),
+    url = config.OcrModelUrl,
+    preset = config.OcrModelPreset,
+    model = config.OcrModel,
+}));
 
 // ---------- 评分模块数据源（评分在前端浏览器内执行） ----------
 // ---------- 评分（后端计算，两阶段） ----------
 app.MapPost("/api/scoring/compute", (HttpRequest req) =>
 {
     if (ScoringService.Running) return J(new { error = "评分已在进行中" }, 409);
+    if (ClipEmbedding.Running) return J(new { error = "向量补算进行中" }, 409);
     var force = bool.TryParse(req.Query["force"].ToString(), out var f) && f;
-    Task.Run(() => ScoringService.Compute(
-        root,
-        config.RealDirs.ToList().AsReadOnly(), config.CandidateDirs.ToList().AsReadOnly(),
-        templateMeta, aaMeta, ocrMap,
-        adoptedCodes, adoptedSources,
-        vecPath, resultsPath, LoadScoring));
+    Task.Run(() =>
+    {
+        // 工作区随时可能新增图片：先增量补算缺失向量，再评分
+        ClipEmbedding.Rebuild(dataDir, modelPath, false);
+        ScoringService.Compute(
+            config.LiveDirs.ToList().AsReadOnly(), config.CandidateDirs.ToList().AsReadOnly(),
+            OcrService.LoadTexts(dataDir),
+            vecPath, resultsPath, LoadScoring);
+    });
     return J(new { started = true, force });
 });
 
@@ -332,38 +392,38 @@ app.MapGet("/api/fs/dirs", (string? path, bool? all) =>
     return J(new { path = dir, parent, dirs });
 });
 
-app.MapGet("/img/real/{*path}", async (string path) =>
+app.MapGet("/img/live/{*path}", async (string path) =>
 {
     var name = Path.GetFileName(path);
     if (name.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)) name = name[..^4];
     var safe = name + ".jpg";
 
-    foreach (var dir in config.RealDirs)
+    foreach (var dir in config.LiveDirs)
     {
         var p = Path.Combine(dir, safe);
         if (File.Exists(p)) return Results.File(p, "image/jpeg");
     }
 
-    // 本地未命中 → 依次尝试远程前缀（默认优先），成功后缓存到第一个真实图目录
-    var prefixes = config.RealPrefixes.ToList();
+    // 本地未命中 → 依次尝试远程前缀（默认优先），成功后缓存到第一个线上现图目录
+    var prefixes = config.LivePrefixes.ToList();
     if (config.DefaultPrefixIndex > 0 && config.DefaultPrefixIndex < prefixes.Count)
         prefixes = [prefixes[config.DefaultPrefixIndex], .. prefixes.Where((_, i) => i != config.DefaultPrefixIndex)];
     var client = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient("img");
-    var iconPath = IconPathOf(name);
+    var iconPath = LivePathOf(name);
     foreach (var prefix in prefixes)
     {
         try
         {
-            var url = prefix.Url.TrimEnd('/') + iconPath;
+            var url = prefix.Url.TrimEnd('/') + "/" + iconPath.TrimStart('/');
             using var resp = await client.GetAsync(url);
             if (!resp.IsSuccessStatusCode) continue;
             var bytes = await resp.Content.ReadAsByteArrayAsync();
-            if (config.RealDirs.Count > 0)
+            if (config.LiveDirs.Count > 0)
             {
                 try
                 {
-                    Directory.CreateDirectory(config.RealDirs[0]);
-                    await File.WriteAllBytesAsync(Path.Combine(config.RealDirs[0], safe), bytes);
+                    Directory.CreateDirectory(config.LiveDirs[0]);
+                    await File.WriteAllBytesAsync(Path.Combine(config.LiveDirs[0], safe), bytes);
                 }
                 catch { /* 缓存失败不影响返回 */ }
             }
@@ -388,19 +448,19 @@ app.MapGet("/img/cand/{file}", (string file) =>
 });
 
 // ---------- 启动自检：向量增量补算 + 评分重算（发布口径，appsettings AutoInit 可关） ----------
-if (app.Configuration.GetValue("AutoInit", true))
+// 未配置任何目录时跳过，保证空配置也能秒开
+if (app.Configuration.GetValue("AutoInit", true)
+    && (config.LiveDirs.Count > 0 || config.CandidateDirs.Count > 0))
 {
     Task.Run(() =>
     {
         try
         {
             if (!File.Exists(modelPath)) return;
-            ClipEmbedding.Rebuild(root, modelPath, false); // 增量：已有键跳过
+            ClipEmbedding.Rebuild(dataDir, modelPath, false); // 增量：已有键跳过
             ScoringService.Compute(
-                root,
-                config.RealDirs.ToList().AsReadOnly(), config.CandidateDirs.ToList().AsReadOnly(),
-                templateMeta, aaMeta, ocrMap,
-                adoptedCodes, adoptedSources,
+                config.LiveDirs.ToList().AsReadOnly(), config.CandidateDirs.ToList().AsReadOnly(),
+                OcrService.LoadTexts(dataDir),
                 vecPath, resultsPath, LoadScoring);
         }
         catch (Exception ex) { Console.Error.WriteLine("AutoInit failed: " + ex.Message); }
@@ -458,44 +518,44 @@ app.MapPost("/api/adopt/move", async (HttpRequest req) =>
     return J(new { targetDir = target, moved, skipped, items });
 });
 
+// 所选候选图相对其候选图目录的地址（找不到源文件时退回文件名）
+string CandRelPath(string file)
+{
+    var safe = Path.GetFileName(file);
+    foreach (var dir in config.CandidateDirs)
+    {
+        var fp = Path.Combine(dir, safe);
+        if (File.Exists(fp))
+            return Path.GetRelativePath(dir, fp).Replace(Path.DirectorySeparatorChar, '/');
+    }
+    return safe;
+}
+
 app.MapGet("/api/export", () =>
 {
     try
     {
         var picks = LoadPicks();
         var sb = new StringBuilder("\ufeff");
-        sb.AppendLine("\"game_code\",\"hall\",\"name\",\"candidate_file\",\"aa123_group\",\"aa123_name\",\"total\",\"target_file\"");
+        sb.Append("game_code,target_file\r\n");
+        // 先按当前评分结果顺序，再补不在本次结果里的点选（配置/目录变过也不漏）
+        var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Emit(string code)
+        {
+            if (!emitted.Add(code) || !picks.TryGetValue(code, out var file)) return;
+            sb.Append(Q(code) + "," + Q(CandRelPath(file)) + "\r\n");
+        }
         foreach (var g in games.EnumerateArray())
         {
             var code = g.GetProperty("code").GetString()!;
-            if (!picks.TryGetValue(code, out var file)) continue;
-            var cand = g.GetProperty("top").EnumerateArray()
-                .FirstOrDefault(t => t.GetProperty("file").GetString() == file);
-            string S(JsonElement e, string k) => e.ValueKind != JsonValueKind.Object ? ""
-                : !e.TryGetProperty(k, out var v) ? ""
-                : v.ValueKind == JsonValueKind.Number ? v.GetRawText()
-                : v.GetString() ?? "";
-            string Score(JsonElement e) => e.ValueKind != JsonValueKind.Object ? ""
-                : !e.TryGetProperty("score", out var v) || v.ValueKind != JsonValueKind.Number ? "—"
-                : v.GetDouble().ToString("0.000");
-            // 过期点选：候选已不在当前 Top5 → 用 aa123 元数据补名称/厂商，分数留空
-            string group, cname, score;
-            if (cand.ValueKind == JsonValueKind.Object)
-            {
-                group = S(cand, "group"); cname = S(cand, "name"); score = Score(cand);
-            }
-            else
-            {
-                group = aaMeta.TryGetValue(Path.GetFileName(file), out var am) ? am.Group : "";
-                cname = aaMeta.TryGetValue(Path.GetFileName(file), out var am2) ? am2.Name : "";
-                score = "—";
-            }
-            sb.AppendLine(string.Join(",",
-                Q(code), Q(S(g, "hall")), Q(S(g, "name")), Q(file),
-                Q(group), Q(cname), Q(score),
-                Q($"long/{code}.jpg")));
+            if (picks.ContainsKey(code)) Emit(code);
         }
-        return Results.Text(sb.ToString(), "text/csv; charset=utf-8");
+        foreach (var code in picks.Keys.Where(c => !emitted.Contains(c))
+                     .OrderBy(c => c, StringComparer.OrdinalIgnoreCase))
+            Emit(code);
+
+        var name = $"已选图标-{DateTime.Now:yyyyMMddHHmmss}.csv";
+        return Results.File(Encoding.UTF8.GetBytes(sb.ToString()), "text/csv; charset=utf-8", name);
     }
     catch (Exception ex)
     {
@@ -511,10 +571,27 @@ app.Run();
 class Config
 {
     public List<string> CandidateDirs { get; set; } = new();
-    public List<string> RealDirs { get; set; } = new();
+    public List<string> LiveDirs { get; set; } = new();
     [JsonConverter(typeof(PrefixListConverter))]
-    public List<PrefixItem> RealPrefixes { get; set; } = new();
+    public List<PrefixItem> LivePrefixes { get; set; } = new();
     public int DefaultPrefixIndex { get; set; }
+    // 线上现图完整路径拼接规则，{code} 为游戏编码占位符
+    public string LivePathPattern { get; set; } = "long/{code}.jpg";
+    // 模型下载地址（发布包不带模型）
+    public string ModelUrl { get; set; } = "";
+    // OCR 模型基础地址（PP-OCRv5 目录）与识别模型预设（latin/ch/en）
+    public string OcrModelUrl { get; set; } = "";
+    public string OcrModelPreset { get; set; } = "latin";
+    // 识别模型选择：预设键（latin/ch/en）或自定义基础地址（http…）
+    public string OcrModel { get; set; } = "latin";
+}
+
+class ModelDownloadState
+{
+    public bool Running;
+    public long Done, Total;
+    public string? Error;
+    public DateTime? StartedAt, FinishedAt;
 }
 
 class PrefixItem

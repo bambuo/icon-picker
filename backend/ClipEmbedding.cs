@@ -84,34 +84,36 @@ public static class ClipEmbedding
         return n > 0 ? vec.Select(v => v / n).ToArray() : vec;
     }
 
-    /// <summary>全量重建 vectors.json（默认跳过已有键，force 全部重算）。</summary>
-    public static void Rebuild(string dataRoot, string modelPath, bool force)
+    /// <summary>全量重建 vectors.json（默认跳过已有键，force 全部重算）。dataDir 为运行期数据目录（DATA_DIR）。</summary>
+    public static void Rebuild(string dataDir, string modelPath, bool force)
     {
         Running = true; Error = null; Done = 0; StartedAt = DateTime.Now; FinishedAt = null;
         try
         {
-            var backendData = Path.Combine(dataRoot, "icon-picker", "backend", "data");
-            var cfgPath = Path.Combine(backendData, "config.json");
-            var vecPath = Path.Combine(backendData, "vectors.json");
+            var cfgPath = Path.Combine(dataDir, "config.json");
+            var vecPath = Path.Combine(dataDir, "vectors.json");
             var cfg = File.Exists(cfgPath)
                 ? JsonSerializer.Deserialize<Config>(File.ReadAllText(cfgPath), JsonOpt) ?? new Config()
                 : new Config();
 
             var jobs = new List<(string Key, string Abs)>();
-            foreach (var d in cfg.CandidateDirs.Concat(cfg.RealDirs))
+            foreach (var raw in cfg.CandidateDirs.Concat(cfg.LiveDirs))
             {
+                var d = Path.IsPathRooted(raw) ? raw : Path.Combine(dataDir, raw);
                 if (!Directory.Exists(d)) continue;
                 foreach (var f in Directory.EnumerateFiles(d))
                 {
                     var ext = Path.GetExtension(f).ToLowerInvariant();
                     if (ext is not ".jpg" and not ".jpeg" and not ".png" and not ".webp") continue;
-                    jobs.Add((Path.GetRelativePath(dataRoot, f).Replace(Path.DirectorySeparatorChar, '/'), f));
+                    jobs.Add((Path.GetFullPath(f), f));
                 }
             }
 
             var vectors = File.Exists(vecPath)
                 ? JsonSerializer.Deserialize<Dictionary<string, float[]>>(File.ReadAllText(vecPath), JsonOpt) ?? new()
                 : new();
+            // 清掉旧版相对键（现在键一律为绝对路径）
+            foreach (var stale in vectors.Keys.Where(k => !Path.IsPathRooted(k)).ToList()) vectors.Remove(stale);
             var todo = jobs.Where(j => force || !vectors.TryGetValue(j.Key, out var v) || v.Length == 0).ToList();
             Total = todo.Count; Done = 0;
             foreach (var (key, abs) in todo)

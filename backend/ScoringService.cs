@@ -16,7 +16,6 @@ public static class ScoringService
     public static DateTime? StartedAt, FinishedAt;
 
     private const double SameImg = 0.78, High = 0.75, Mid = 0.62;
-    private static readonly string[] Brand = ["pg", "soft", "pocket", "games", "premium", "gaming", "759", "e", "do", "de", "the", "a"];
     private static readonly string[] TextBrand = ["pg", "soft", "pocket", "games", "premium", "gaming", "759"];
     private static readonly string[] ImageExt = [".jpg", ".jpeg", ".png", ".webp"];
 
@@ -35,8 +34,6 @@ public static class ScoringService
             if (CharUnicodeInfo.GetUnicodeCategory(ch) != UnicodeCategory.NonSpacingMark) sb.Append(ch);
         return NonAlnum.Replace(Marks.Replace(sb.ToString(), " "), " ").Trim();
     }
-    private static string[] NameTokens(string s) =>
-        NormName(s).Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(t => t.Length > 1 && !Brand.Contains(t)).ToArray();
     private static IEnumerable<string> Bigrams(string s)
     {
         var t = NormName(s).Replace(" ", "");
@@ -49,18 +46,6 @@ public static class ScoringService
         var inter = A.Count(x => B.Contains(x));
         return 2.0 * inter / (A.Count + B.Count);
     }
-    private static double NameSim(string a, string b)
-    {
-        var A = NameTokens(a).ToHashSet(); var B = NameTokens(b).ToHashSet();
-        var inter = A.Count(x => B.Contains(x));
-        var union = A.Count + B.Count - inter;
-        var jac = union > 0 ? (double)inter / union : 0;
-        var d = Dice(a, b);
-        var na = NormName(a).Replace(" ", "");
-        var nb = NormName(b).Replace(" ", "");
-        var contain = na.Length >= 4 && nb.Length >= 4 && (na.Contains(nb) || nb.Contains(na)) ? 1.0 : 0.0;
-        return Math.Max(0.35 * jac + 0.35 * d + 0.30 * contain, contain * (0.6 + 0.4 * Math.Max(jac, d)));
-    }
     private static string NormText(string s) => NonAlnum.Replace(Marks.Replace(s ?? "", " ").ToLowerInvariant(), " ").Trim();
     private static string[] TextTokens(string s) =>
         NormText(s).Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(t => t.Length > 1 && !TextBrand.Contains(t)).ToArray();
@@ -71,9 +56,9 @@ public static class ScoringService
         var hit = A.Count(t => B.Contains(t));
         return 0.6 * (hit / (double)A.Length) + 0.4 * Dice(aText, bText);
     }
-    private static double Combine(double img, double? text, double name)
+    private static double Combine(double img, double? text)
     {
-        var num = 0.45 * img + 0.30 * name; var den = 0.45 + 0.30;
+        var num = 0.45 * img; var den = 0.45;
         if (text.HasValue) { num += 0.25 * text.Value; den += 0.25; }
         return num / den;
     }
@@ -143,14 +128,10 @@ public static class ScoringService
         return den == 0 ? 0 : (n * sab - sa * sb) / den;
     }
 
-    /// <summary>两阶段评分：语义排序（CLIP+名字+文字，秒级）→ 像素同图比对（后台）。onUpdate 回传最新 JSON。</summary>
+    /// <summary>两阶段评分：语义排序（CLIP+图上文字，秒级）→ 像素同图比对（后台）。onUpdate 回传最新 JSON。</summary>
     public static void Compute(
-        string dataRoot,
-        IReadOnlyList<string> realDirs, IReadOnlyList<string> candDirs,
-        IReadOnlyDictionary<string, (string Name, string Hall)> templateMeta,
-        IReadOnlyDictionary<string, (string Name, string Group)> aaMeta,
-        IReadOnlyDictionary<string, string> ocrMap,
-        IReadOnlySet<string> adoptedCodes, IReadOnlySet<string> adoptedSources,
+        IReadOnlyList<string> liveDirs, IReadOnlyList<string> candDirs,
+        IReadOnlyDictionary<string, string> ocrByPath,
         string vectorsPath, string outPath, Action<string> onUpdate)
     {
         Running = true; Error = null; StartedAt = DateTime.Now; FinishedAt = null;
@@ -160,34 +141,30 @@ public static class ScoringService
             var rawVec = JsonSerializer.Deserialize<Dictionary<string, float[]>>(File.ReadAllText(vectorsPath)) ?? new();
             foreach (var (k, v) in rawVec) VecNorm[k] = NormVec(v);
 
-            var realFiles = realDirs.Where(Directory.Exists).SelectMany(ListImages).ToList();
+            var liveFiles = liveDirs.Where(Directory.Exists).SelectMany(ListImages).ToList();
             var candFiles = candDirs.Where(Directory.Exists).SelectMany(ListImages).ToList();
-            var reals = realFiles.Select(f => (abs: f, code: Path.GetFileNameWithoutExtension(f), key: Rel(dataRoot, f)))
-                .Where(x => !adoptedCodes.Contains(x.code)).ToList();
-            var cands = candFiles.Select(f => (abs: f, baseName: Path.GetFileName(f), key: Rel(dataRoot, f)))
-                .Where(x => !adoptedSources.Contains(x.baseName)).ToList();
-            Total = reals.Count; Done = 0; Phase = "语义排序";
+            var lives = liveFiles.Select(f => (abs: f, code: Path.GetFileNameWithoutExtension(f), key: Path.GetFullPath(f))).ToList();
+            var cands = candFiles.Select(f => (abs: f, baseName: Path.GetFileName(f), key: Path.GetFullPath(f))).ToList();
+            Total = lives.Count; Done = 0; Phase = "语义排序";
 
-            var results = new List<RealResult>();
-            foreach (var r in reals)
+            var results = new List<LiveResult>();
+            foreach (var r in lives)
             {
                 var qv = VecNorm.TryGetValue(r.key, out var v) ? v : Array.Empty<double>();
-                var qtxt = ocrMap.TryGetValue(Path.GetFileName(r.abs), out var t) ? t : "";
-                templateMeta.TryGetValue(r.code, out var tm);
+                var qtxt = ocrByPath.TryGetValue(r.abs, out var t) ? t : "";
                 var scored = new List<(Cand c, double total)>();
                 foreach (var p in cands)
                 {
                     var img = VecNorm.TryGetValue(p.key, out var pv) && qv.Length > 0 ? Math.Clamp(Cosine(qv, pv), 0, 1) : 0;
-                    var name = aaMeta.TryGetValue(p.baseName, out var am) ? am.Name : "";
-                    var group = aaMeta.TryGetValue(p.baseName, out var am2) ? am2.Group : "";
-                    var nm = NameSim(tm.Name, name);
-                    var tx = TextSim(qtxt, ocrMap.TryGetValue(p.baseName, out var ot) ? ot : "");
-                    var total = Combine(img, tx, nm);
-                    scored.Add((new Cand { File = p.baseName, Group = group, Name = name, Img = img, Text = tx, NameSim = nm }, total));
+                    var name = "";
+                    var group = "";
+                    var tx = TextSim(qtxt, ocrByPath.TryGetValue(p.abs, out var ot) ? ot : "");
+                    var total = Combine(img, tx);
+                    scored.Add((new Cand { File = p.baseName, Group = group, Name = name, Img = img, Text = tx, NameSim = null }, total));
                 }
                 var top = scored.OrderByDescending(s => s.total).Take(5)
                     .Select(s => { s.c.Score = s.total; return s.c; }).ToList();
-                results.Add(new RealResult { Code = r.code, Hall = tm.Hall, Name = tm.Name, Abs = r.abs, Top = top });
+                results.Add(new LiveResult { Code = r.code, Hall = "", Name = "", Abs = r.abs, Top = top });
                 Done++;
             }
             results.Sort((a, b) => (b.Top.FirstOrDefault()?.Img ?? -1).CompareTo(a.Top.FirstOrDefault()?.Img ?? -1));
@@ -213,11 +190,11 @@ public static class ScoringService
             }
             foreach (var r in results)
             {
-                var hasRealFeat = PixCache.TryGetValue(r.Abs, out var rf);
+                var hasLiveFeat = PixCache.TryGetValue(r.Abs, out var rf);
                 foreach (var c in r.Top)
                 {
                     var candAbs = CandAbsOf(candDirs, c.File);
-                    if (hasRealFeat && PixCache.TryGetValue(candAbs, out var cf))
+                    if (hasLiveFeat && PixCache.TryGetValue(candAbs, out var cf))
                     {
                         c.Pixel = PixelSim(rf, cf);
                         c.Corr = Pearson(rf.Gray, cf.Gray);
@@ -239,19 +216,18 @@ public static class ScoringService
         }
     }
 
-    private static string Serialize(List<RealResult> results, int candCount) =>
+    private static string Serialize(List<LiveResult> results, int candCount) =>
         JsonSerializer.Serialize(new
         {
             high = High, mid = Mid, sameImg = SameImg,
             poolCount = candCount,
             results = results.Select(r => new
             {
-                code = r.Code, hall = r.Hall, name = r.Name, hasReal = true,
+                code = r.Code, hall = r.Hall, name = r.Name, hasLive = true,
                 top = r.Top.Select(c => new { file = c.File, group = c.Group, name = c.Name, score = c.Score, img = c.Img, pixel = c.Pixel, text = c.Text, nameSim = c.NameSim, corr = c.Corr }),
             }),
         });
 
-    private static string Rel(string root, string abs) => Path.GetRelativePath(root, abs).Replace(Path.DirectorySeparatorChar, '/');
     private static IEnumerable<string> ListImages(string dir) =>
         Directory.EnumerateFiles(dir).Where(f => ImageExt.Contains(Path.GetExtension(f).ToLowerInvariant()));
     private static string CandAbsOf(IReadOnlyList<string> candDirs, string file)
@@ -273,10 +249,10 @@ public static class ScoringService
         public double Img { get; set; }
         public double? Pixel { get; set; }
         public double? Text { get; set; }
-        public double NameSim { get; set; }
+        public double? NameSim { get; set; }
         public double? Corr { get; set; }
     }
-    public class RealResult
+    public class LiveResult
     {
         public string Code { get; set; } = "";
         public string Abs { get; set; } = "";

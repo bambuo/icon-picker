@@ -8,8 +8,15 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.31.0" />
-    <PackageReference Include="SkiaSharp" Version="4.153.1" />
-    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="4.153.1" />
+    <PackageReference Include="RapidOcrNet" Version="4.2.0" />
+    <!-- RapidOcrNet 依赖 SkiaSharp 3.x，锁定同版本避免二进制不兼容 -->
+    <PackageReference Include="SkiaSharp" Version="3.119.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.macOS" Version="3.119.1" />
+  </ItemGroup>
+
+  <!-- 运行时状态目录不进发布包（发布脚本单独打数据快照） -->
+  <ItemGroup>
+    <Content Remove="data/**" />
   </ItemGroup>
 
 </Project>
