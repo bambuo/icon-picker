@@ -315,6 +315,23 @@ app.MapGet("/api/scoring/status", () => J(new
     ScoringService.FinishedAt,
 }));
 
+// ---------- 文件系统目录浏览（前端选路径用） ----------
+app.MapGet("/api/fs/dirs", (string? path, bool? all) =>
+{
+    var dir = string.IsNullOrWhiteSpace(path)
+        ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+        : Path.GetFullPath(path);
+    if (!Directory.Exists(dir)) return J(new { error = "目录不存在" }, 400);
+    var showAll = all == true;
+    var dirs = Directory.EnumerateDirectories(dir)
+        .Where(d => showAll || !Path.GetFileName(d).StartsWith("."))
+        .Select(Path.GetFileName)
+        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+    var parent = Directory.GetParent(dir)?.FullName;
+    return J(new { path = dir, parent, dirs });
+});
+
 app.MapGet("/img/real/{*path}", async (string path) =>
 {
     var name = Path.GetFileName(path);

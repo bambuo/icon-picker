@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { Message } from '@arco-design/web-vue'
+import { IconFolder } from '@arco-design/web-vue/es/icon'
 
 interface Cand {
   file: string
@@ -112,7 +113,7 @@ const loadPicks = async () => {
   picks.value = await (await fetch('/api/picks')).json()
 }
 onMounted(async () => {
-  await Promise.all([loadPicks(), loadCfgLabel(), loadData()])
+  await Promise.all([loadPicks(), loadCfgLabel(), loadData(), pollEmbed()])
   loading.value = false
 })
 
@@ -158,6 +159,29 @@ const closeAndAnalyze = async () => {
   moveOpen.value = false
   await analyze()
 }
+// ---------- 目录浏览器（后端 /api/fs/dirs，点选文件夹选路径） ----------
+const fsOpen = ref(false)
+const fsPath = ref(''), fsParent = ref(''), fsDirs = ref<string[]>([])
+const fsShowAll = ref(false)
+const fsTarget = ref<'move' | 'realDir' | 'candDir'>('move')
+const loadFs = async (p: string) => {
+  const j = await (await fetch(`/api/fs/dirs?path=${encodeURIComponent(p)}&all=${fsShowAll.value}`)).json()
+  if (j.error) { Message.error(j.error); return }
+  fsPath.value = j.path; fsParent.value = j.parent ?? ''; fsDirs.value = j.dirs ?? []
+}
+const openFs = (target: 'move' | 'realDir' | 'candDir') => {
+  fsTarget.value = target; fsOpen.value = true; loadFs('')
+}
+const enterFs = (name: string) => loadFs(fsPath.value === '/' ? '/' + name : fsPath.value + '/' + name)
+const upFs = () => { if (fsParent.value) loadFs(fsParent.value) }
+const pickFs = () => {
+  const p = fsPath.value
+  if (fsTarget.value === 'move') moveTarget.value = p
+  else if (fsTarget.value === 'realDir' && !cfg.value.realDirs.includes(p)) cfg.value.realDirs.push(p)
+  else if (fsTarget.value === 'candDir' && !cfg.value.candidateDirs.includes(p)) cfg.value.candidateDirs.push(p)
+  fsOpen.value = false
+}
+
 const runMove = async () => {
   moveRunning.value = true
   try {
@@ -272,7 +296,7 @@ const saveCfg = async () => {
           </a-space>
         </div>
         <a-typography-text type="secondary" class="sub">
-          真实图取自 {{ defaultPrefixLabel || "…" }} 现图 · 候选池 {{ data?.poolCount ?? '—' }} 张 · 综合分 = 图像 45% + 名字 30% + 图上文字 25% · 口径见 相似度标准.md
+          真实图取自 {{ defaultPrefixLabel || "…" }} 现图 · 候选池 {{ data?.poolCount ?? '—' }} 张 · 向量 {{ embedStatus.vectors }} · 综合分 = 图像 45% + 名字 30% + 文字 25%
         </a-typography-text>
         <div class="bar">
           <a-radio-group v-model:model-value="filter" type="button" size="small">
@@ -393,13 +417,13 @@ const saveCfg = async () => {
             </div>
             <a-input-group class="cfg-add cfg-add-prefix">
               <a-input v-model="newPrefixName" placeholder="别名，如 正式环境" size="small" allow-clear style="width: 130px" />
-              <a-input v-model="newPrefix" placeholder="https://static.example.com" size="small" allow-clear @keydown.enter="addPrefix" />
+              <a-input v-model="newPrefix" placeholder="https://static.example.com" allow-clear @keydown.enter="addPrefix" />
               <a-button type="primary" size="small" @click="addPrefix">添加前缀</a-button>
             </a-input-group>
           </a-space>
         </a-card>
 
-        <a-card title="真实图本地目录（按顺序回退；远程取回后缓存到第一个）" size="small">
+        <a-card title="真实图目录" size="small">
           <a-space direction="vertical" fill style="width: 100%" :size="6">
             <div v-for="(d, i) in cfg.realDirs" :key="d" class="cfg-item">
               <div class="cfg-row">
@@ -414,12 +438,13 @@ const saveCfg = async () => {
             
               <a-input-group class="cfg-add">
               <a-input v-model="newReal" placeholder="绝对路径，如 /Users/xxx/图标目录" allow-clear @keydown.enter="addDir(cfg.realDirs, newReal)" />
+              <a-button @click="openFs('realDir')">浏览</a-button>
               <a-button type="primary" @click="addDir(cfg.realDirs, newReal)">添加目录</a-button>
             </a-input-group>
           </a-space>
         </a-card>
 
-        <a-card title="候选图目录（按顺序查找）" size="small">
+        <a-card title="候选图目录" size="small">
           <a-space direction="vertical" fill style="width: 100%" :size="6">
             <div v-for="(d, i) in cfg.candidateDirs" :key="d" class="cfg-item">
               <div class="cfg-row">
@@ -434,6 +459,7 @@ const saveCfg = async () => {
             
               <a-input-group class="cfg-add">
               <a-input v-model="newCand" placeholder="绝对路径，如 /Users/xxx/未使用图标" allow-clear @keydown.enter="addDir(cfg.candidateDirs, newCand)" />
+              <a-button @click="openFs('candDir')">浏览</a-button>
               <a-button type="primary" @click="addDir(cfg.candidateDirs, newCand)">添加目录</a-button>
             </a-input-group>
           </a-space>
@@ -476,14 +502,17 @@ const saveCfg = async () => {
   <a-modal v-model:visible="moveOpen" title="点选落盘（重命名 + 转 JPEG + 移动）" :width="640" :mask-closable="false" unmount-on-close>
     <a-space direction="vertical" fill style="width: 100%" :size="12">
       <a-alert type="info">已选 {{ counts.picked }} 个 · 重命名为 {game_code}.jpg 并转 JPEG 后移动到目标目录，源文件删除</a-alert>
-      <a-input v-model="moveTarget" :placeholder="defaultMoveDir + '（留空用默认）'" allow-clear />
+      <a-input-group class="cfg-add">
+        <a-input v-model="moveTarget" :placeholder="defaultMoveDir + '（留空用默认）'" allow-clear />
+        <a-button @click="openFs('move')">浏览</a-button>
+      </a-input-group>
       <template v-if="moveResult">
         <a-space size="small">
           <a-tag color="green" size="large">成功 {{ moveResult.moved }}</a-tag>
           <a-tag v-if="moveResult.skipped" color="orange" size="large">跳过/失败 {{ moveResult.skipped }}</a-tag>
           <a-typography-text type="secondary" code style="font-size: 11px">{{ moveResult.targetDir }}</a-typography-text>
         </a-space>
-        <div style="max-height: 260px; overflow: auto">
+        <div class="move-list" style="max-height: 260px; overflow: auto">
           <div v-for="it in moveResult.items" :key="it.code" style="font-size: 12px; padding: 2px 0">
             <a-tag size="small" :color="it.status === 'ok' ? 'green' : 'orange'">{{ it.status === 'ok' ? '成功' : it.status === 'skip' ? '跳过' : '失败' }}</a-tag>
             <span class="dim">{{ it.code }}</span>
@@ -499,6 +528,29 @@ const saveCfg = async () => {
         <a-button :disabled="moveRunning" @click="moveOpen = false">关闭</a-button>
         <a-button v-if="!moveResult" type="primary" :loading="moveRunning" :disabled="!counts.picked" @click="runMove">开始移动</a-button>
         <a-button v-else type="primary" :disabled="moveRunning" @click="closeAndAnalyze">关闭并重新分析</a-button>
+      </a-space>
+    </template>
+  </a-modal>
+
+  <a-modal v-model:visible="fsOpen" title="选择目录" :width="560" unmount-on-close>
+    <a-space direction="vertical" fill style="width: 100%" :size="10">
+      <div class="fs-path-row">
+        <a-button size="mini" :disabled="!fsParent" @click="upFs">上级</a-button>
+        <a-typography-text class="cfg-text" code :title="fsPath" style="flex: 1; min-width: 0">{{ fsPath }}</a-typography-text>
+        <a-checkbox v-model:model-value="fsShowAll" @change="loadFs(fsPath)">显示隐藏目录</a-checkbox>
+      </div>
+      <div class="fs-list" style="max-height: 320px; overflow: auto; border: 1px solid var(--color-border-2); border-radius: 8px">
+        <div
+          v-for="d in fsDirs" :key="d"
+          class="fs-dir" @click="enterFs(d)"
+        ><IconFolder /> {{ d }}</div>
+        <a-empty v-if="!fsDirs.length" description="无子目录" style="padding: 24px 0" />
+      </div>
+    </a-space>
+    <template #footer>
+      <a-space>
+        <a-button @click="fsOpen = false">取消</a-button>
+        <a-button type="primary" @click="pickFs">选此目录</a-button>
       </a-space>
     </template>
   </a-modal>
@@ -598,7 +650,17 @@ const saveCfg = async () => {
   display: block; cursor: default;
 }
 .cfg-row .arco-space { flex: none; }
-.cfg-add { display: flex; width: 100%; margin-top: 2px; }
-.cfg-add > .arco-input-wrapper { flex: 1; min-width: 0; }
+.fs-path-row { display: flex; align-items: center; gap: 8px; width: 100%; }
+.fs-path-row .arco-checkbox { flex: none; white-space: nowrap; }
+.cfg-add { display: flex; width: 100%; margin-top: 2px; align-items: stretch; }
+.cfg-add > .arco-input-wrapper { flex: 1; min-width: 0; height: 32px; }
+.cfg-add > .arco-btn { height: 32px; }
 .cfg-add-prefix > .arco-input-wrapper:first-child { flex: 0 0 130px; }
+.fs-dir { padding: 7px 14px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--color-border-1); }
+.fs-dir:hover { background: var(--color-fill-2); }
+.fs-list, .move-list { scrollbar-color: var(--color-fill-3) transparent; }
+.fs-list::-webkit-scrollbar, .move-list::-webkit-scrollbar { width: 8px; }
+.fs-list::-webkit-scrollbar-track, .move-list::-webkit-scrollbar-track { background: transparent; }
+.fs-list::-webkit-scrollbar-thumb, .move-list::-webkit-scrollbar-thumb { background: var(--color-fill-3); border-radius: 4px; }
+.fs-list::-webkit-scrollbar-thumb:hover, .move-list::-webkit-scrollbar-thumb:hover { background: var(--color-fill-4); }
 </style>
