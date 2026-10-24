@@ -18,6 +18,7 @@ public static class OcrService
     private static readonly object EngineLock = new();
     private static RapidOcr? _engine;
     private static string? _dataDir;
+    private static string? _bundleRoot;
     private const string DetFile = "ch_PP-OCRv5_mobile_det.onnx";
     private const string DetRemote = "ch_PP-OCRv5_det_mobile.onnx";
     private const string ClsFile = "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx";
@@ -43,18 +44,20 @@ public static class OcrService
 
     private sealed class ModelMeta { public string Preset { get; set; } = "latin"; public string Rec { get; set; } = ""; public string Dict { get; set; } = ""; }
 
-    public static void Configure(string dataDir)
+    public static void Configure(string dataDir, string? bundleRoot = null)
     {
         _dataDir = dataDir;
+        _bundleRoot = bundleRoot ?? AppContext.BaseDirectory;
         EnsureMeta(dataDir);
     }
     public static string ModelDir(string dataDir) => Path.Combine(dataDir, "ocr-models");
-    private static string BundleV5() => Path.Combine(AppContext.BaseDirectory, "models", "v5");
+    private static string BundleV5() => Path.Combine(_bundleRoot ?? AppContext.BaseDirectory, "models", "v5");
     private static string? BundleDict()
     {
+        var root = _bundleRoot ?? AppContext.BaseDirectory;
         var candidates = new[]
         {
-            Path.Combine(AppContext.BaseDirectory, "models", "ppocrv5_latin_dict.txt"),
+            Path.Combine(root, "models", "ppocrv5_latin_dict.txt"),
             Path.Combine(BundleV5(), "ppocrv5_latin_dict.txt"),
             Path.Combine(Directory.GetCurrentDirectory(), "models", "v5", "ppocrv5_latin_dict.txt"),
         };

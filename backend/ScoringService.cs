@@ -156,15 +156,13 @@ public static class ScoringService
                 foreach (var p in cands)
                 {
                     var img = VecNorm.TryGetValue(p.key, out var pv) && qv.Length > 0 ? Math.Clamp(Cosine(qv, pv), 0, 1) : 0;
-                    var name = "";
-                    var group = "";
                     var tx = TextSim(qtxt, ocrByPath.TryGetValue(p.abs, out var ot) ? ot : "");
                     var total = Combine(img, tx);
-                    scored.Add((new Cand { File = p.baseName, Group = group, Name = name, Img = img, Text = tx, NameSim = null }, total));
+                    scored.Add((new Cand { File = p.baseName, Img = img, Text = tx }, total));
                 }
                 var top = scored.OrderByDescending(s => s.total).Take(5)
                     .Select(s => { s.c.Score = s.total; return s.c; }).ToList();
-                results.Add(new LiveResult { Code = r.code, Hall = "", Name = "", Abs = r.abs, Top = top });
+                results.Add(new LiveResult { ImageCode = r.code, Abs = r.abs, Top = top });
                 Done++;
             }
             results.Sort((a, b) => (b.Top.FirstOrDefault()?.Img ?? -1).CompareTo(a.Top.FirstOrDefault()?.Img ?? -1));
@@ -223,8 +221,8 @@ public static class ScoringService
             poolCount = candCount,
             results = results.Select(r => new
             {
-                code = r.Code, hall = r.Hall, name = r.Name, hasLive = true,
-                top = r.Top.Select(c => new { file = c.File, group = c.Group, name = c.Name, score = c.Score, img = c.Img, pixel = c.Pixel, text = c.Text, nameSim = c.NameSim, corr = c.Corr }),
+                imageCode = r.ImageCode, hasLive = true,
+                top = r.Top.Select(c => new { file = c.File, score = c.Score, img = c.Img, pixel = c.Pixel, text = c.Text, corr = c.Corr }),
             }),
         });
 
@@ -243,21 +241,16 @@ public static class ScoringService
     public class Cand
     {
         public string File { get; set; } = "";
-        public string Group { get; set; } = "";
-        public string Name { get; set; } = "";
         public double Score { get; set; }
         public double Img { get; set; }
         public double? Pixel { get; set; }
         public double? Text { get; set; }
-        public double? NameSim { get; set; }
         public double? Corr { get; set; }
     }
     public class LiveResult
     {
-        public string Code { get; set; } = "";
+        public string ImageCode { get; set; } = "";
         public string Abs { get; set; } = "";
-        public string Hall { get; set; } = "";
-        public string Name { get; set; } = "";
         public List<Cand> Top { get; set; } = new();
     }
 }
