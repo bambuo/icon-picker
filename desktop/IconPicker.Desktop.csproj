@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>IconPicker</AssemblyName>
+    <RootNamespace>IconPicker.Desktop</RootNamespace>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Controls.WebView" Version="12.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../backend/IconPicker.Api.csproj" />
+    <EmbeddedResource Include="../deploy/assets/AppIcon.png" LogicalName="AppIcon.png" />
+  </ItemGroup>
+
+  <!-- 发布时嵌入前端/配置/字典 zip（-p:EmbedDesktopPayload=true） -->
+  <ItemGroup Condition="'$(EmbedDesktopPayload)' == 'true' And Exists('desktop-payload.zip')">
+    <EmbeddedResource Include="desktop-payload.zip" LogicalName="desktop-payload.zip" />
+  </ItemGroup>
+
+</Project>

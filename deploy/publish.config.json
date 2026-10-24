@@ -2,14 +2,15 @@
   "$schema": "发布配置：cd deploy && bun publish.mjs [--rid osx-arm64]",
   "runtimes": [
     "osx-arm64",
-    "win-x64"
+    "win-x64",
+    "linux-arm64",
+    "linux-x64"
   ],
   "app": {
     "name": "图标筛选工作台",
     "bundleId": "com.bambuo.iconpicker",
     "version": "1.0.0",
-    "icon": "assets/AppIcon.icns",
-    "launcher": "app/launcher.swift"
+    "icon": "assets/AppIcon.icns"
   },
   "frontend": {
     "buildCmd": "bun run build",
@@ -17,6 +18,9 @@
   },
   "backend": {
     "project": "../backend/IconPicker.Api.csproj"
+  },
+  "desktop": {
+    "project": "../desktop/IconPicker.Desktop.csproj"
   },
   "package": {
     "outDir": "out"
