@@ -1,42 +1,25 @@
 # 图标筛选工作台（icon-picker）
 
-线上「已排序但缺图标」游戏的选图工具：左侧线上现图（static.ppcabt.com 现图），右侧评分 Top5 候选，点选采用并导出 CSV。打分口径见 `../相似度标准.md`。
+为「已排序但缺图标」的游戏挑选线上现图与候选图标、生成采用清单的本地工作台。后端 C#（ASP.NET Core Minimal API）、前端 Vue 3 + Arco Design，可打包为 macOS `.app`/`.dmg` 与 Windows 免安装目录。
 
-## 技术栈
+## 功能
 
-- 后端：C# / ASP.NET Core Minimal API（net10.0，无第三方依赖）
-- 前端：Vue 3 + TypeScript + Vite + Arco Design Vue，Bun 管理依赖
-- 评分引擎：在后端（`ScoringService.cs`，CLIP 余弦 + 后端本地 OCR 文字因子 + SkiaSharp 像素同图，两阶段）；头部「重新分析」触发 `POST /api/scoring/compute`，进度经 `GET /api/scoring/status`，完成后前端自动刷新数据（热更新内存，无需重启）
-- 图像向量：由后端 `POST /api/embed/rebuild` 生成（SkiaSharp 预处理 + ONNX Runtime），落 `backend/data/vectors.json`
-- 存储：点选记录落 `backend/data/picks.json`；评分留档 `backend/data/visual-results.json`；向量 `backend/data/vectors.json`
+- 每个游戏展示线上现图与评分 Top5 候选，候选卡点选采用、再点取消
+- 分档筛选（同图 / 高相似 / 中相似 / 低 / 计算中 / 已选）与编码搜索
+- 长列表虚拟滚动，千级数据滚动与浮层不卡顿
+- 点选服务端持久化；导出 CSV；落盘移动（重命名为 `{game_code}.jpg`、转 JPEG、移动到目标目录）
+- CLIP 向量与跨平台 OCR 的模型下载、增量/全量重建与进度展示
+- 亮色 / 暗色主题
 
-## 发布（macOS / Windows 桌面端）
+## 工作原理
 
-```bash
-cd deploy
-bun publish.mjs                  # 全量：osx-arm64 + win-x64
-bun publish.mjs --rid osx-arm64  # 只打 macOS（迭代时用）
-```
+- 数据源：线上现图目录（文件名即游戏编码）与候选图目录，均在「配置」中指定
+- 评分：图像因子 = CLIP 余弦（0.45），文字因子 = 图上 OCR 文本相似度（0.25），缺项时按剩余权重归一；像素三特征（灰度/直方图/dHash）只用于判定「同图」，不参与综合分
+- 分档：像素 ≥ 0.78 为同图；综合分 ≥ 0.75 高相似、≥ 0.62 中相似，其余为低
+- 「重新分析」两阶段：语义排序（完成即落盘并热更新内存）→ 像素同图比对（后台补充，完成再次热更新）
+- 向量与 OCR 结果均缓存在运行期数据目录，评分时直接读取
 
-包内只有**引擎**：原生壳（WKWebView 窗口 + 启停后端）+ 自包含单文件后端 + 前端 `wwwroot` + OCR 字典（2KB）；不含任何业务数据、不预置任何路径，CLIP 与 OCR 模型都由用户在配置里下载。启动不需要配置：界面立即加载，只是没有数据，路径由用户在工作台「配置」里自行添加。
-
-线上现图/候选图目录、路径规则、CLIP 与 OCR 模型地址都在「配置」里设置。图上文字（OCR）由后端本地完成（PaddleOCR PP-OCRv5 ONNX，Windows/macOS/Linux 通用）：OCR 模型按需下载到运行期数据目录，识别结果缓存为 `ocr-cache.json`，可在「配置 → 图上文字（OCR）」里增量/全量识别。
-
-产物：
-
-- macOS：`out/osx-arm64/图标筛选工作台.app` 与 `图标筛选工作台-macOS-arm64.dmg`。打开 dmg 把 app 拖进 Applications 即安装；双击即进原生窗口，空配置可用；所有路径与模型地址在「配置」抽屉里设置，保存后即时生效（模型/目录变更后按提示补算向量、重新分析）。
-- Windows：`out/win-x64/图标筛选工作台/` 与 `图标筛选工作台-win-x64.zip`。解压后双击 `Start.cmd` 立即启动并打开浏览器；所有路径与模型地址在「配置」抽屉里设置。
-
-运行期状态：
-
-- macOS：`~/Library/Application Support/IconPicker/`（`data/` 放 config/picks/vectors/模型/评分结果，`logs/backend.log` 日志，`current-port.txt` 当前端口）。可用 `ICON_PICKER_HOME` 指定状态目录。
-- Windows：状态在 `%APPDATA%\IconPicker`，`data-root/` 为空时作为默认数据根。
-
-分发说明：本地构建为 ad-hoc 签名；拷到其他 Mac 首次打开若被 Gatekeeper 拦，执行 `xattr -dr com.apple.quarantine "图标筛选工作台.app"` 或右键打开。监听端口由壳每次自动选空闲端口（开发模式仍是固定 5177）。
-
-macOS 壳源码 `deploy/app/launcher.swift`，应用图标由 `deploy/make-icon.swift` 生成（产物已提交为 `deploy/assets/AppIcon.icns`）。
-
-## 启动
+## 快速开始（开发）
 
 ```bash
 # 后端（端口 5177）
@@ -49,44 +32,90 @@ bun install   # 首次
 bun dev
 ```
 
-打开 http://localhost:5173 。开发模式下运行期数据在 `backend/data`，可用 `DATA_DIR` 环境变量覆盖；图片目录与模型地址都在页面「配置」里设置。
+打开 http://localhost:5173 。开发模式运行期数据在 `backend/data`，可用 `DATA_DIR` 环境变量覆盖。
 
-## 重新生成打分数据
+首次使用顺序：
 
-重算评分：工作台头部「重新分析」按钮（后端两阶段计算，语义排序秒级、像素比对稍慢，进度实时显示）；向量重建：配置抽屉「图像向量」里增量/全量。新增目录/图片后先增量重建向量再重新分析。
+1. 「配置」里添加线上现图目录、候选图目录（绝对路径），按需配置前缀与路径规则
+2. 下载 CLIP 模型 → 增量重建向量
+3. （可选）下载 OCR 模型 → 增量/全量识别
+4. 点「重新分析」
+5. 点选候选 → 导出 CSV 或落盘移动
 
-注意：`score.mjs` 会同时覆盖 `视觉筛选报告.html` 与 `视觉筛选候选.csv`（与工作台同源同口径）。
+## 配置项
+
+配置保存在运行期数据的 `config.json`，页面「配置」抽屉可视化编辑，保存即生效（图片响应 `no-store`）。
+
+| 字段 | 说明 |
+|---|---|
+| `liveDirs` | 线上现图目录，按顺序回退 |
+| `candidateDirs` | 候选图目录 |
+| `livePrefixes` | 线上现图远程前缀列表 `[{url, name}]`，`defaultPrefixIndex` 指定默认 |
+| `livePathPattern` | 线上现图远程路径规则，默认 `long/{code}.jpg`，必须含 `{code}` |
+| `modelUrl` | CLIP 模型下载地址（默认 HuggingFace Xenova/clip-vit-base-patch32） |
+| `ocrModel` | OCR 识别模型：预设 `latin` / `ch` / `en`，或自定义模型基础地址（http/https，按 latin 识别模型处理） |
+| `ocrModelUrl` | OCR 模型默认基础地址（ModelScope PP-OCRv5） |
+
+## 打包发布
+
+```bash
+cd deploy
+bun publish.mjs                  # 全量：osx-arm64 + win-x64
+bun publish.mjs --rid osx-arm64  # 只打 macOS
+```
+
+产物：
+
+- macOS：`out/osx-arm64/图标筛选工作台.app` 与 `图标筛选工作台-macOS-arm64.dmg`。拖入 Applications 安装，双击进入原生窗口（WKWebView 壳）
+- Windows：`out/win-x64/图标筛选工作台/` 与 `图标筛选工作台-win-x64.zip`。解压双击 `Start.cmd`，就绪后自动打开浏览器
+
+包内只有引擎：原生壳 + 自包含单文件后端 + 前端 `wwwroot` + OCR 字典（2KB）。CLIP 与 OCR 模型不随包，由用户在「配置」里下载。
+
+运行期状态：
+
+- macOS：`~/Library/Application Support/IconPicker/`（`data/` 存 config、picks、vectors、模型、OCR 缓存与评分结果；`runtime/` 为后端工作目录；`logs/backend.log`；`current-port.txt`）
+- Windows：`%APPDATA%\IconPicker\`
+
+本地构建为 ad-hoc 签名；拷到其他 Mac 首次打开若被 Gatekeeper 拦截，执行 `xattr -dr com.apple.quarantine "图标筛选工作台.app"` 或右键打开。监听端口由壳自动选择空闲端口（开发模式固定 5177）。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/data` | 打分结果全量（199 游戏 × Top5 候选 + 阈值） |
-| GET | `/api/picks` | 当前点选 `{game_code: candidate_file}` |
-| PUT | `/api/picks/{code}` | body `{"file":"..."}`，候选文件须存在于图标池 |
-| DELETE | `/api/picks/{code}` | 取消单个 |
-| DELETE | `/api/picks` | 清空 |
-| GET | `/api/config` | 读取配置；`livePrefixes` 为 `[{url, name}]`（name 为别名） |
-| PUT | `/api/config` | 保存配置；目录地址原样持久化（允许先配置后建目录，使用端跳过不存在的）、前缀去重并兜底命名、默认序号越界重置为 0；`livePathPattern` 为线上现图完整路径规则（默认 `long/{code}.jpg`，必须含 `{code}`），用于按前缀远程取线上现图；`modelUrl` 为 CLIP 模型下载地址、`ocrModelUrl` 为 OCR 模型基础地址、`ocrModelPreset` 为识别模型（latin/ch/en） |
-| GET | `/api/embed/status` | 向量重建进度（running/done/total/vectors） |
-| POST | `/api/embed/rebuild?force=` | 重建 CLIP 向量（SkiaSharp + ONNX，增量默认，force 全量）；模型未下载时返回 400 |
-| POST | `/api/model/download` | 下载 CLIP 模型到运行期数据目录（body 可带 `url`，缺省用配置 `modelUrl`；默认 HuggingFace Xenova/clip-vit-base-patch32） |
-| GET | `/api/model/status` | 模型下载进度与是否就绪 |
-| POST | `/api/ocr/rebuild?force=` | 跨平台 OCR 识别线上现图/候选图（增量默认，force 全量），结果缓存到 `ocr-cache.json` |
-| GET | `/api/ocr/status` | OCR 识别进度、缓存条数与上次更新时间 |
-| POST | `/api/ocr/model/download` | 下载 OCR 模型（body 可带 `url` 与 `preset`；preset ∈ latin/ch/en，默认 latin；地址默认 ModelScope PP-OCRv5） |
+| GET | `/api/data` | 评分结果快照与阈值 |
+| GET | `/api/config` | 读取配置 |
+| PUT | `/api/config` | 保存配置：目录原样持久化、前缀去重、路径规则校验 `{code}`、模型地址校验 http(s) |
+| GET | `/api/picks` | 点选集 `{game_code: candidate_file}` |
+| PUT | `/api/picks/{code}` | body `{"file":"..."}`，候选文件须存在于候选目录 |
+| DELETE | `/api/picks/{code}` | 取消单个点选 |
+| DELETE | `/api/picks` | 清空点选 |
+| POST | `/api/scoring/compute` | 重新分析（先增量补算向量再评分） |
+| GET | `/api/scoring/status` | 评分阶段与进度 |
+| GET | `/api/embed/status` | 向量进度、向量数、上次重建时间 |
+| POST | `/api/embed/rebuild?force=` | 重建 CLIP 向量（增量默认，force 全量） |
+| POST | `/api/model/download` | 下载 CLIP 模型，body 可带 `url` |
+| GET | `/api/model/status` | CLIP 模型下载进度与是否就绪 |
+| POST | `/api/ocr/rebuild?force=` | OCR 识别线上现图/候选图（增量默认） |
+| GET | `/api/ocr/status` | OCR 进度、缓存条数、上次识别时间 |
+| POST | `/api/ocr/model/download` | 下载 OCR 模型，body 可带 `model`（预设或地址） |
 | GET | `/api/ocr/model/status` | OCR 模型下载进度与是否就绪 |
-| GET | `/api/export` | 导出已选 CSV（两列 `game_code,target_file`，其中 target_file = 所选候选图在其候选图目录内的相对地址；UTF-8 BOM + CRLF，附件下载带时间戳文件名；先按当前结果顺序、再补不在本次结果里的点选，不漏记录） |
-| GET | `/img/live/{code}.jpg` | 线上现图：按配置目录顺序回退，本地未命中时按前缀（默认优先）远程取图并缓存到第一个目录；远程路径 = 前缀 + `livePathPattern` |
+| GET | `/api/export` | 导出 CSV（`game_code,target_file`，target_file 为候选图在候选目录内的相对地址；UTF-8 BOM + CRLF） |
+| POST | `/api/adopt/move` | 落盘移动，body 可带 `targetDir`，默认 `~/Desktop/{yyyyMMddHHmmss}` |
+| GET | `/api/fs/dirs?path=&all=` | 目录浏览（前端选路径），`all=true` 显示隐藏目录 |
+| GET | `/img/live/{code}.jpg` | 线上现图：本地目录回退，未命中按前缀远程取图并缓存到第一个目录 |
+| GET | `/img/cand/{file}` | 候选图 |
 
-配置改动即时生效（图片响应带 no-store），无需重启；前端「配置」抽屉可视化编辑。 |
-| GET | `/img/cand/{file}` | 候选图（`未使用图标/`，按扩展名返回 MIME） |
+## 目录结构
 
-## 功能
+```
+backend/            ASP.NET Core 后端（Program.cs 路由、ScoringService 评分、ClipEmbedding 向量、OcrService 识别）
+frontend/           Vue 3 + Vite + Arco 工作台界面
+deploy/             publish.mjs 打包脚本、launcher.swift 原生壳、图标与发布配置
+icon-picker.slnx    .NET 解决方案文件
+```
 
-- 分档筛选（同图 / 高相似 / 中相似 / 低相似 / 无线上现图 / 已选）+ 编码/名称/厂商搜索
-- 长列表虚拟滚动（只渲染可视区附近卡片，千级数据滚动/浮层不卡顿）
-- 点选即持久化（服务端），刷新不丢；卡片头显示「已选 → long/{game_code}.jpg」
-- 线上现图 a-image 点击可放大目检；候选区整卡点选
-- 亮色 / 暗色主题（Arco `arco-theme`，记忆在浏览器本地）
-- 导出 CSV 两列：game_code, target_file（target_file = 所选候选图在其候选图目录内的相对地址）
+## 已知限制
+
+- CLIP 与 OCR 模型需联网下载（地址可改）；OCR 内置 PP-OCRv5 的 Latin / 中文 / 英文识别模型
+- OCR 对高度风格化的艺术字识别有限，文字因子缺失时评分自动只用图像分
+- 权重与阈值是经验值，集中在 `ScoringService.cs` 常量中
