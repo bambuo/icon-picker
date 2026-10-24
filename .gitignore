@@ -14,8 +14,6 @@ models/
 # 运行时状态（点选/向量/评分/配置，随机器走）
 backend/data/
 
-# 管线生成物
-pipeline/data/
 .idea/
 .vscode/
 *.user
