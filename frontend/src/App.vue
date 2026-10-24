@@ -6,19 +6,14 @@ import { IconFolder } from '@arco-design/web-vue/es/icon'
 
 interface Cand {
   file: string
-  group: string
-  name: string
   score: number
   img: number
   text: number | null
-  nameSim: number | null
   corr: number | null
   pixel: number | null
 }
-interface Game {
-  code: string
-  hall: string
-  name: string
+interface ImageItem {
+  imageCode: string
   hasLive: boolean
   pending?: boolean
   top: Cand[]
@@ -28,12 +23,11 @@ interface Data {
   mid: number
   sameImg: number
   poolCount: number
-  results: Game[]
+  results: ImageItem[]
 }
 
 const data = ref<Data | null>(null)
 const picks = ref<Record<string, string>>({})
-const query = ref('')
 const filter = ref('all')
 const loading = ref(true)
 const analyzing = ref(false)
@@ -64,16 +58,46 @@ const theme = ref<'dark' | 'light'>(
   (localStorage.getItem('icon-theme') as 'dark' | 'light') || 'dark',
 )
 
+const sendChromeTheme = (t: 'dark' | 'light') => {
+  const bridge = (window as any).invokeCSharpAction
+  if (typeof bridge !== 'function') return
+  const rgba = (name: string) => {
+    const el = document.createElement('span')
+    el.style.color = `var(${name})`
+    document.body.appendChild(el)
+    const value = getComputedStyle(el).color
+    el.remove()
+    const m = value.match(/rgba?\(([^)]+)\)/)
+    if (!m) return null
+    const parts = m[1].split(',').map((v) => Number(v.trim()))
+    return [
+      Math.round(parts[0]), Math.round(parts[1]), Math.round(parts[2]),
+      parts.length > 3 ? Math.round(parts[3] * 255) : 255,
+    ]
+  }
+  bridge(JSON.stringify({
+    type: 'theme',
+    value: t,
+    bg: rgba('--color-bg-1'),
+    line: rgba('--color-border-2'),
+    text: rgba('--color-text-2'),
+    fill: rgba('--color-fill-2'),
+    danger: [245, 63, 63, 255],
+  }))
+}
+
 watch(theme, (t) => {
   document.body.setAttribute('arco-theme', t)
+  document.documentElement.style.colorScheme = t
   localStorage.setItem('icon-theme', t)
+  setTimeout(() => sendChromeTheme(t), 0)
 }, { immediate: true })
 
 const SAME = computed(() => data.value?.sameImg ?? 0.78)
 const HIGH = computed(() => data.value?.high ?? 0.75)
 const MID = computed(() => data.value?.mid ?? 0.62)
 
-const tierOf = (g: Game) => {
+const tierOf = (g: ImageItem) => {
   if (g.pending) return 'pending'
   const b = g.top[0]
   if (!g.hasLive || !b) return 'none'
@@ -95,20 +119,15 @@ const counts = computed(() => {
   for (const g of data.value?.results ?? []) {
     c.all++
     c[tierOf(g)]++
-    if (picks.value[g.code]) c.picked++
+    if (picks.value[g.imageCode]) c.picked++
   }
   return c
 })
 
-const visible = computed(() => {
-  const q = query.value.trim().toLowerCase()
-  return (data.value?.results ?? []).filter((g) => {
-    const okF = filter.value === 'all' ? true
-      : filter.value === 'picked' ? !!picks.value[g.code] : tierOf(g) === filter.value
-    const okQ = !q || `${g.code} ${g.name} ${g.hall}`.toLowerCase().includes(q)
-    return okF && okQ
-  })
-})
+const visible = computed(() => (data.value?.results ?? []).filter((g) =>
+  filter.value === 'all' ? true
+    : filter.value === 'picked' ? !!picks.value[g.imageCode] : tierOf(g) === filter.value
+))
 
 // 虚拟滚动：只渲染可视区附近的卡片（WebKit 下超长列表 + 浮层会卡死）
 const scrollEl = ref<HTMLElement | null>(null)
@@ -117,16 +136,16 @@ const virtualizer = useVirtualizer(computed(() => ({
   getScrollElement: () => scrollEl.value,
   estimateSize: () => 430,
   overscan: 3,
-  getItemKey: (i: number) => visible.value[i]?.code ?? i,
+  getItemKey: (i: number) => visible.value[i]?.imageCode ?? i,
 })))
 const vItems = computed(() => virtualizer.value.getVirtualItems())
 const vRows = computed(() => vItems.value.flatMap((v) => {
   const g = visible.value[v.index]
-  return g ? [{ index: v.index, start: v.start, code: g.code, g }] : []
+  return g ? [{ index: v.index, start: v.start, imageCode: g.imageCode, g }] : []
 }))
 const vTotal = computed(() => virtualizer.value.getTotalSize())
 const measureRow = (el: any) => { if (el) virtualizer.value.measureElement(el as Element) }
-watch([filter, query], () => {
+watch(filter, () => {
   virtualizer.value.scrollToOffset(0)
   virtualizer.value.measure()
 })
@@ -170,8 +189,8 @@ onMounted(async () => {
   void watchStartupScoring()
 })
 
-const toggle = async (g: Game, c: Cand) => {
-  const code = g.code
+const toggle = async (g: ImageItem, c: Cand) => {
+  const code = g.imageCode
   if (picks.value[code] === c.file) {
     delete picks.value[code]
     picks.value = { ...picks.value }
@@ -199,6 +218,12 @@ const exportCsv = async () => {
     const content = await resp.text()
     const d = new Date(), p2 = (n: number) => String(n).padStart(2, '0')
     const name = `已选图标-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}.csv`
+    const avalonia = (window as any).invokeCSharpAction
+    if (typeof avalonia === 'function') {
+      avalonia(JSON.stringify({ name, content }))
+      Message.success('已保存到下载目录')
+      return
+    }
     const bridge = (window as any).webkit?.messageHandlers?.saveFile
     if (bridge) {
       bridge.postMessage({ name, content })
@@ -486,10 +511,6 @@ const saveCfg = async () => {
             <a-radio value="pending">计算中 {{ counts.pending }}</a-radio>
             <a-radio value="picked">已选 {{ counts.picked }}</a-radio>
           </a-radio-group>
-        <a-input-search
-          v-model="query" placeholder="搜索 编码 / 名称 / 厂商" style="width: 260px"
-          allow-clear size="small"
-        />
           <div class="spacer" />
           <a-space size="small">
             <a-tag color="arcoblue">已选 {{ counts.picked }}</a-tag>
@@ -512,19 +533,18 @@ const saveCfg = async () => {
         <a-spin :loading="loading" style="display: block; width: 100%">
           <div v-if="visible.length" class="vlist" :style="{ height: vTotal + 'px' }">
             <div
-              v-for="row in vRows" :key="row.code" :data-index="row.index" :ref="measureRow"
+              v-for="row in vRows" :key="row.imageCode" :data-index="row.index" :ref="measureRow"
               class="vrow" :style="{ transform: `translateY(${row.start}px)` }"
             >
-              <a-card class="gcard" :class="[tierOf(row.g), { picked: !!picks[row.g.code] }]">
+              <a-card class="gcard" :class="[tierOf(row.g), { picked: !!picks[row.g.imageCode] }]">
                 <template #title>
                   <div class="card-title">
                     <a-space size="small">
-                      <a-typography-text bold class="code">{{ row.g.code }}</a-typography-text>
-                      <a-typography-text v-if="row.g.hall || row.g.name" type="secondary">{{ row.g.hall }} · {{ row.g.name }}</a-typography-text>
-                      <a-tag size="small" :color="tierColor[tierOf(row.g)]">{{ tierName[tierOf(row.g)] }}</a-tag>
+                      <a-typography-text bold class="code">{{ row.g.imageCode }}</a-typography-text>
+                        <a-tag size="small" :color="tierColor[tierOf(row.g)]">{{ tierName[tierOf(row.g)] }}</a-tag>
                     </a-space>
-                    <a-tag v-if="picks[row.g.code]" size="small" color="arcoblue" class="picked-tag">
-                      已选 → {{ pathOf(row.g.code) }}
+                    <a-tag v-if="picks[row.g.imageCode]" size="small" color="arcoblue" class="picked-tag">
+                      已选 → {{ pathOf(row.g.imageCode) }}
                     </a-tag>
                   </div>
                 </template>
@@ -534,12 +554,12 @@ const saveCfg = async () => {
                       <div class="colhead livehead">线上现图</div>
                       <div class="thumb live-thumb">
                         <img
-                          v-if="row.g.hasLive" class="live-img" :src="`/img/live/${row.g.code}.jpg`" :alt="row.g.code"
-                          loading="lazy" decoding="async" @click="openPreview(`/img/live/${row.g.code}.jpg`)"
+                          v-if="row.g.hasLive" class="live-img" :src="`/img/live/${row.g.imageCode}.jpg`" :alt="row.g.imageCode"
+                          loading="lazy" decoding="async" @click="openPreview(`/img/live/${row.g.imageCode}.jpg`)"
                         />
                         <a-empty v-else description="缺失" style="padding: 24px 0" />
                       </div>
-                      <a-typography-text type="secondary" class="path">{{ row.g.code }}.jpg</a-typography-text>
+                      <a-typography-text type="secondary" class="path">{{ row.g.imageCode }}.jpg</a-typography-text>
                     </div>
                   </a-col>
                   <a-col :span="20" :md="19">
@@ -548,23 +568,22 @@ const saveCfg = async () => {
                     <div v-else class="cands">
                       <div
                         v-for="(c, k) in row.g.top" :key="c.file"
-                        class="cand" :class="[candTier(c), { on: picks[row.g.code] === c.file }]"
+                        class="cand" :class="[candTier(c), { on: picks[row.g.imageCode] === c.file }]"
                         @click="toggle(row.g, c)"
                       >
                         <div class="rank-row">
                           <span class="rank-no">#{{ k + 1 }}</span>
                           <span class="score" :class="candTier(c)">{{ pct(c.score) }}</span>
                           <span v-if="c.pixel != null && c.pixel >= SAME" class="same-chip">同图</span>
-                          <span v-if="picks[row.g.code] === c.file" class="check-chip">✓ 已选</span>
+                          <span v-if="picks[row.g.imageCode] === c.file" class="check-chip">✓ 已选</span>
                         </div>
                         <div class="thumb">
-                          <img :src="`/img/cand/${encodeURIComponent(c.file)}`" :alt="c.name" loading="lazy" decoding="async">
+                          <img :src="`/img/cand/${encodeURIComponent(c.file)}`" :alt="c.file" loading="lazy" decoding="async">
                         </div>
                           <div class="cand-file">{{ c.file }}</div>
                         <div class="factors">
                           <span class="fx" title="图像结构因子">图 {{ c.img.toFixed(2) }}</span>
                           <span class="fx" :class="{ na: c.text == null }" title="图上文字因子（OCR）">文 {{ f2(c.text) }}</span>
-                          <span v-if="c.nameSim != null" class="fx" title="名字因子">名 {{ c.nameSim.toFixed(2) }}</span>
                         </div>
                         <div class="corr">{{ c.corr == null ? `clip 余弦 ${c.img.toFixed(2)}` : `结构 corr ${c.corr.toFixed(2)}` }}</div>
                       </div>
@@ -755,7 +774,7 @@ const saveCfg = async () => {
 
   <a-modal v-model:visible="moveOpen" title="点选落盘（重命名 + 转 JPEG + 移动）" :width="640" :mask-closable="false" unmount-on-close>
     <a-space direction="vertical" fill style="width: 100%" :size="12">
-      <a-alert type="info">已选 {{ counts.picked }} 个 · 重命名为 {game_code}.jpg 并转 JPEG 后移动到目标目录，源文件删除</a-alert>
+      <a-alert type="info">已选 {{ counts.picked }} 个 · 重命名为 {image_code}.jpg 并转 JPEG 后移动到目标目录，源文件删除</a-alert>
       <a-input-group class="cfg-add">
         <a-input v-model="moveTarget" :placeholder="defaultMoveDir + '（留空用默认）'" allow-clear />
         <a-button @click="openFs('move')">浏览</a-button>
@@ -812,9 +831,9 @@ const saveCfg = async () => {
 
 <style scoped>
 .app-layout { height: 100vh; overflow: hidden; }
-.content { flex: 1; min-height: 0; overflow-y: auto; scrollbar-color: var(--color-fill-3) transparent; }
+.content { flex: 1; min-height: 0; overflow-y: auto; background: var(--color-bg-1); scrollbar-color: var(--color-fill-3) var(--color-bg-1); }
 .content::-webkit-scrollbar { width: 10px; }
-.content::-webkit-scrollbar-track { background: transparent; }
+.content::-webkit-scrollbar-track { background: var(--color-bg-1); }
 .content::-webkit-scrollbar-thumb { background: var(--color-fill-3); border-radius: 5px; }
 .content::-webkit-scrollbar-thumb:hover { background: var(--color-fill-4); }
 .hdr {
@@ -926,9 +945,9 @@ const saveCfg = async () => {
 .cfg-add-prefix > .arco-input-wrapper:first-child { flex: 0 0 130px; }
 .fs-dir { padding: 7px 14px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--color-border-1); }
 .fs-dir:hover { background: var(--color-fill-2); }
-.fs-list, .move-list { scrollbar-color: var(--color-fill-3) transparent; }
+.fs-list, .move-list { scrollbar-color: var(--color-fill-3) var(--color-bg-1); }
 .fs-list::-webkit-scrollbar, .move-list::-webkit-scrollbar { width: 8px; }
-.fs-list::-webkit-scrollbar-track, .move-list::-webkit-scrollbar-track { background: transparent; }
+.fs-list::-webkit-scrollbar-track, .move-list::-webkit-scrollbar-track { background: var(--color-bg-1); }
 .fs-list::-webkit-scrollbar-thumb, .move-list::-webkit-scrollbar-thumb { background: var(--color-fill-3); border-radius: 4px; }
 .fs-list::-webkit-scrollbar-thumb:hover, .move-list::-webkit-scrollbar-thumb:hover { background: var(--color-fill-4); }
 </style>
