@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useVirtualizer } from '@tanstack/vue-virtual'
 import { Message } from '@arco-design/web-vue'
 import { IconFolder } from '@arco-design/web-vue/es/icon'
 
@@ -10,7 +11,7 @@ interface Cand {
   score: number
   img: number
   text: number | null
-  nameSim: number
+  nameSim: number | null
   corr: number | null
   pixel: number | null
 }
@@ -18,7 +19,7 @@ interface Game {
   code: string
   hall: string
   name: string
-  hasReal: boolean
+  hasLive: boolean
   pending?: boolean
   top: Cand[]
 }
@@ -75,14 +76,14 @@ const MID = computed(() => data.value?.mid ?? 0.62)
 const tierOf = (g: Game) => {
   if (g.pending) return 'pending'
   const b = g.top[0]
-  if (!g.hasReal || !b) return 'none'
+  if (!g.hasLive || !b) return 'none'
   if (b.pixel != null && b.pixel >= SAME.value) return 'same'
   if (b.score >= HIGH.value) return 'high'
   if (b.score >= MID.value) return 'mid'
   return 'low'
 }
 const tierName: Record<string, string> = {
-  same: '同图', high: '可直接采用', mid: '建议目检', low: '低', none: '无真实图', pending: '计算中',
+  same: '同图', high: '高相似', mid: '中相似', low: '低相似', none: '无线上现图', pending: '计算中',
 }
 const tierColor: Record<string, string> = {
   same: 'magenta', high: 'green', mid: 'orange', low: 'gray', none: 'red', pending: 'gray',
@@ -109,12 +110,64 @@ const visible = computed(() => {
   })
 })
 
+// 虚拟滚动：只渲染可视区附近的卡片（WebKit 下超长列表 + 浮层会卡死）
+const scrollEl = ref<HTMLElement | null>(null)
+const virtualizer = useVirtualizer(computed(() => ({
+  count: visible.value.length,
+  getScrollElement: () => scrollEl.value,
+  estimateSize: () => 430,
+  overscan: 3,
+  getItemKey: (i: number) => visible.value[i]?.code ?? i,
+})))
+const vItems = computed(() => virtualizer.value.getVirtualItems())
+const vRows = computed(() => vItems.value.flatMap((v) => {
+  const g = visible.value[v.index]
+  return g ? [{ index: v.index, start: v.start, code: g.code, g }] : []
+}))
+const vTotal = computed(() => virtualizer.value.getTotalSize())
+const measureRow = (el: any) => { if (el) virtualizer.value.measureElement(el as Element) }
+watch([filter, query], () => {
+  virtualizer.value.scrollToOffset(0)
+  virtualizer.value.measure()
+})
+
 const loadPicks = async () => {
   picks.value = await (await fetch('/api/picks')).json()
 }
+// 启动自检（向量补算 + 评分重算）进行中：显示进度，完成后自动刷新数据
+const watchStartupScoring = async () => {
+  const get = async (p: string) => (await fetch(p)).json()
+  let sawRunning = false
+  try {
+    while (true) {
+      const [e, st] = await Promise.all([get('/api/embed/status'), get('/api/scoring/status')])
+      if (e.running || st.running) {
+        if (!sawRunning) {
+          sawRunning = true
+          analyzing.value = true
+        }
+        analyzeProg.value = e.running
+          ? { phase: '补算向量', done: e.done, total: e.total }
+          : { phase: st.phase, done: st.done, total: st.total }
+        await new Promise((r) => setTimeout(r, 1000))
+        continue
+      }
+      if (!sawRunning) return
+      await new Promise((r) => setTimeout(r, 1500))
+      const st2 = await get('/api/scoring/status')
+      if (!st2.running) break
+    }
+    await loadData()
+  } finally {
+    analyzing.value = false
+    analyzeProg.value = null
+  }
+}
 onMounted(async () => {
+  scrollEl.value = document.querySelector('.arco-layout-content') as HTMLElement | null
   await Promise.all([loadPicks(), loadCfgLabel(), loadData(), pollEmbed()])
   loading.value = false
+  void watchStartupScoring()
 })
 
 const toggle = async (g: Game, c: Cand) => {
@@ -139,7 +192,27 @@ const clearAll = async () => {
   Message.info('已清空')
 }
 
-const exportCsv = () => { window.location.href = '/api/export' }
+const exportCsv = async () => {
+  try {
+    const resp = await fetch('/api/export')
+    if (!resp.ok) { Message.error('导出失败：' + (await resp.text()).slice(0, 80)); return }
+    const content = await resp.text()
+    const d = new Date(), p2 = (n: number) => String(n).padStart(2, '0')
+    const name = `已选图标-${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}.csv`
+    const bridge = (window as any).webkit?.messageHandlers?.saveFile
+    if (bridge) {
+      bridge.postMessage({ name, content })
+      Message.success('已保存到下载目录')
+      return
+    }
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }))
+    const a = document.createElement('a')
+    a.href = url; a.download = name; a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    Message.error('导出失败：' + (e as Error).message)
+  }
+}
 
 const moveOpen = ref(false)
 const moveTarget = ref('')
@@ -149,6 +222,10 @@ const now = new Date()
 const p2 = (n: number) => String(n).padStart(2, "0")
 const todayStamp = `${now.getFullYear()}${p2(now.getMonth() + 1)}${p2(now.getDate())}${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`
 const defaultMoveDir = '~/Desktop/' + todayStamp
+const previewOpen = ref(false)
+const previewSrc = ref('')
+const openPreview = (src: string) => { previewSrc.value = src; previewOpen.value = true }
+
 const openMove = () => {
   if (!counts.value.picked) return
   moveTarget.value = ''
@@ -163,13 +240,13 @@ const closeAndAnalyze = async () => {
 const fsOpen = ref(false)
 const fsPath = ref(''), fsParent = ref(''), fsDirs = ref<string[]>([])
 const fsShowAll = ref(false)
-const fsTarget = ref<'move' | 'realDir' | 'candDir'>('move')
+const fsTarget = ref<'move' | 'liveDir' | 'candDir'>('move')
 const loadFs = async (p: string) => {
   const j = await (await fetch(`/api/fs/dirs?path=${encodeURIComponent(p)}&all=${fsShowAll.value}`)).json()
   if (j.error) { Message.error(j.error); return }
   fsPath.value = j.path; fsParent.value = j.parent ?? ''; fsDirs.value = j.dirs ?? []
 }
-const openFs = (target: 'move' | 'realDir' | 'candDir') => {
+const openFs = (target: 'move' | 'liveDir' | 'candDir') => {
   fsTarget.value = target; fsOpen.value = true; loadFs('')
 }
 const enterFs = (name: string) => loadFs(fsPath.value === '/' ? '/' + name : fsPath.value + '/' + name)
@@ -177,7 +254,7 @@ const upFs = () => { if (fsParent.value) loadFs(fsParent.value) }
 const pickFs = () => {
   const p = fsPath.value
   if (fsTarget.value === 'move') moveTarget.value = p
-  else if (fsTarget.value === 'realDir' && !cfg.value.realDirs.includes(p)) cfg.value.realDirs.push(p)
+  else if (fsTarget.value === 'liveDir' && !cfg.value.liveDirs.includes(p)) cfg.value.liveDirs.push(p)
   else if (fsTarget.value === 'candDir' && !cfg.value.candidateDirs.includes(p)) cfg.value.candidateDirs.push(p)
   fsOpen.value = false
 }
@@ -190,29 +267,42 @@ const runMove = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ targetDir: moveTarget.value || null }),
     })
-    moveResult.value = await resp.json()
-    if (moveResult.value.moved > 0) await analyze()
+    const res = await resp.json()
+    moveResult.value = res
+    if (res.moved > 0) await analyze()
   } finally {
     moveRunning.value = false
   }
 }
 const pct = (n: number) => (n * 100).toFixed(1) + '%'
 const f2 = (n: number | null) => (n == null ? '—' : n.toFixed(2))
+const fmtTime = (s: string) => {
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return s
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
 
 // ---------- 设置 ----------
 interface PrefixItem { url: string; name: string }
 interface AppConfig {
   candidateDirs: string[]
-  realDirs: string[]
-  realPrefixes: PrefixItem[]
+  liveDirs: string[]
+  livePrefixes: PrefixItem[]
   defaultPrefixIndex: number
+  livePathPattern: string
+  modelUrl: string
+  ocrModelUrl: string
+  ocrModelPreset: string
+  ocrModel: string
 }
 const cfgOpen = ref(false)
-const cfg = ref<AppConfig>({ candidateDirs: [], realDirs: [], realPrefixes: [], defaultPrefixIndex: 0 })
-const newCand = ref(''), newReal = ref(''), newPrefix = ref(''), newPrefixName = ref('')
+const cfg = ref<AppConfig>({ candidateDirs: [], liveDirs: [], livePrefixes: [], defaultPrefixIndex: 0, livePathPattern: 'long/{code}.jpg', modelUrl: '', ocrModelUrl: '', ocrModelPreset: 'latin', ocrModel: 'latin' })
+const newCand = ref(''), newLive = ref(''), newPrefix = ref(''), newPrefixName = ref('')
 const defaultPrefixLabel = ref('')
+const pathPattern = ref('long/{code}.jpg')
 
-const embedStatus = ref<{ running: boolean; done: number; total: number; error: string | null; startedAt?: string; finishedAt?: string | null; vectors: number }>({ running: false, done: 0, total: 0, error: null, finishedAt: null, vectors: 0 })
+const embedStatus = ref<{ running: boolean; done: number; total: number; error: string | null; startedAt?: string; finishedAt?: string | null; vectors: number; updatedAt?: string | null }>({ running: false, done: 0, total: 0, error: null, finishedAt: null, vectors: 0 })
 let embedTimer: number | undefined
 const pollEmbed = async () => {
   embedStatus.value = await (await fetch('/api/embed/status')).json()
@@ -221,6 +311,80 @@ const pollEmbed = async () => {
   } else if (embedTimer) { window.clearInterval(embedTimer); embedTimer = undefined }
 }
 const embedPct = computed(() => embedStatus.value.total > 0 ? Math.min(1, embedStatus.value.done / embedStatus.value.total) : 0)
+interface ModelStatus { running: boolean; done: number; total: number; error: string | null; modelExists: boolean; url?: string }
+const modelStatus = ref<ModelStatus>({ running: false, done: 0, total: 0, error: null, modelExists: true })
+const modelPct = computed(() => modelStatus.value.total > 0 ? Math.min(1, modelStatus.value.done / modelStatus.value.total) : 0)
+interface OcrStatus { running: boolean; done: number; total: number; error: string | null; count: number; updatedAt?: string | null }
+const ocrStatus = ref<OcrStatus>({ running: false, done: 0, total: 0, error: null, count: 0 })
+const ocrPct = computed(() => ocrStatus.value.total > 0 ? Math.min(1, ocrStatus.value.done / ocrStatus.value.total) : 0)
+const loadOcrStatus = async () => {
+  try { ocrStatus.value = await (await fetch('/api/ocr/status')).json() } catch { /* 忽略 */ }
+}
+interface OcrModelStatus { downloading: boolean; dlDone?: number; dlTotal?: number; dlError?: string | null; modelReady: boolean; url?: string }
+const ocrModel = ref<{ downloading: boolean; done: number; total: number; error: string | null; modelReady: boolean }>({ downloading: false, done: 0, total: 0, error: null, modelReady: true })
+const ocrModelOptions = [
+  { label: 'PP-OCRv5 Latin（默认）', value: 'latin' },
+  { label: 'PP-OCRv5 中文', value: 'ch' },
+  { label: 'PP-OCRv5 英文', value: 'en' },
+]
+const ocrModelPct = computed(() => ocrModel.value.total > 0 ? Math.min(1, ocrModel.value.done / ocrModel.value.total) : 0)
+const loadOcrModel = async () => {
+  try {
+    const st: OcrModelStatus = await (await fetch('/api/ocr/model/status')).json()
+    ocrModel.value = {
+      downloading: st.downloading, done: st.dlDone ?? 0, total: st.dlTotal ?? 0,
+      error: st.dlError ?? null, modelReady: st.modelReady,
+    }
+  } catch { /* 忽略 */ }
+}
+const downloadOcrModel = async () => {
+  if (ocrModel.value.downloading) return
+  const resp = await fetch('/api/ocr/model/download', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: cfg.value.ocrModel }),
+  })
+  if (!resp.ok) { Message.error((await resp.json()).error ?? '下载启动失败'); return }
+  while (true) {
+    await loadOcrModel()
+    if (!ocrModel.value.downloading) break
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+  if (ocrModel.value.error) Message.error('OCR 模型下载失败：' + ocrModel.value.error)
+  else Message.success('OCR 模型下载完成')
+}
+
+const rebuildOcr = async (force: boolean) => {
+  if (ocrStatus.value.running) return
+  const resp = await fetch('/api/ocr/rebuild?force=' + force, { method: 'POST' })
+  if (!resp.ok) { Message.error((await resp.json()).error ?? '启动失败'); return }
+  while (true) {
+    await loadOcrStatus()
+    if (!ocrStatus.value.running) break
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+  if (ocrStatus.value.error) Message.error('OCR 失败：' + ocrStatus.value.error)
+  else Message.success(`OCR 完成，共 ${ocrStatus.value.count} 张`)
+}
+
+const loadModelStatus = async () => {
+  try { modelStatus.value = await (await fetch('/api/model/status')).json() } catch { /* 忽略 */ }
+}
+const downloadModel = async () => {
+  if (modelStatus.value.running) return
+  const resp = await fetch('/api/model/download', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: cfg.value.modelUrl }),
+  })
+  if (!resp.ok) { Message.error((await resp.json()).error ?? '下载启动失败'); return }
+  while (true) {
+    await loadModelStatus()
+    if (!modelStatus.value.running) break
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+  if (modelStatus.value.error) { Message.error('模型下载失败：' + modelStatus.value.error); return }
+  Message.success('模型下载完成')
+  await pollEmbed()
+}
 
 const rebuildVectors = async (force: boolean) => {
   const resp = await fetch(`/api/embed/rebuild?force=${force}`, { method: 'POST' })
@@ -230,16 +394,30 @@ const rebuildVectors = async (force: boolean) => {
 }
 
 const openCfg = async () => {
-  cfg.value = await (await fetch('/api/config')).json()
-  newCand.value = newReal.value = newPrefix.value = newPrefixName.value = ''
+  // 先并行取完数据，再一次性赋值，避免连锁触发整页重渲染
+  const [c, e, m, o, om] = await Promise.all([
+    fetch('/api/config').then((r) => r.json()),
+    fetch('/api/embed/status').then((r) => r.json()),
+    fetch('/api/model/status').then((r) => r.json()).catch(() => null),
+    fetch('/api/ocr/status').then((r) => r.json()).catch(() => null),
+    fetch('/api/ocr/model/status').then((r) => r.json()).catch(() => null),
+  ])
+  cfg.value = c
+  embedStatus.value = e
+  if (m) modelStatus.value = m
+  if (o) ocrStatus.value = o
+  if (om) ocrModel.value = { downloading: om.downloading, done: om.dlDone ?? 0, total: om.dlTotal ?? 0, error: om.dlError ?? null, modelReady: om.modelReady }
+  newCand.value = newLive.value = newPrefix.value = newPrefixName.value = ''
+  if (embedStatus.value.running && !embedTimer) embedTimer = window.setInterval(pollEmbed, 1000)
   cfgOpen.value = true
-  await pollEmbed()
 }
 const loadCfgLabel = async () => {
   const c: AppConfig = await (await fetch('/api/config')).json()
-  const p = c.realPrefixes[c.defaultPrefixIndex] ?? c.realPrefixes[0]
+  const p = c.livePrefixes[c.defaultPrefixIndex] ?? c.livePrefixes[0]
   defaultPrefixLabel.value = p ? (p.name || p.url) : ''
+  pathPattern.value = c.livePathPattern || 'long/{code}.jpg'
 }
+const pathOf = (code: string) => (pathPattern.value || 'long/{code}.jpg').replace(/\{code\}/gi, code)
 const addDir = (list: string[], v: string) => {
   const p = v.trim()
   if (!p.startsWith('/')) { Message.warning('请输入绝对路径（以 / 开头）'); return }
@@ -249,8 +427,8 @@ const addDir = (list: string[], v: string) => {
 const addPrefix = () => {
   const p = newPrefix.value.trim().replace(/\/+$/, '')
   if (!/^https?:\/\//.test(p)) { Message.warning('前缀需以 http(s):// 开头'); return }
-  if (cfg.value.realPrefixes.some((x) => x.url === p)) { Message.warning('前缀已存在'); return }
-  cfg.value.realPrefixes.push({ url: p, name: newPrefixName.value.trim() || '未命名' })
+  if (cfg.value.livePrefixes.some((x) => x.url === p)) { Message.warning('前缀已存在'); return }
+  cfg.value.livePrefixes.push({ url: p, name: newPrefixName.value.trim() || '未命名' })
   newPrefix.value = newPrefixName.value = ''
 }
 const move = <T,>(list: T[], i: number, d: -1 | 1) => {
@@ -259,8 +437,6 @@ const move = <T,>(list: T[], i: number, d: -1 | 1) => {
   ;[list[i], list[j]] = [list[j], list[i]]
 }
 const saveCfg = async () => {
-  if (!cfg.value.candidateDirs.length) { Message.error('候选图目录不能为空'); return }
-  if (!cfg.value.realPrefixes.length) { Message.error('至少保留一个真实图前缀'); return }
   const resp = await fetch('/api/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -268,13 +444,14 @@ const saveCfg = async () => {
   })
   if (!resp.ok) { Message.error((await resp.json()).error ?? '保存失败'); return }
   cfg.value = await resp.json()
+  pathPattern.value = cfg.value.livePathPattern || 'long/{code}.jpg'
   cfgOpen.value = false
   Message.success('配置已保存并生效')
 }
 </script>
 
 <template>
-  <a-layout style="min-height: 100vh; background: var(--color-bg-1)">
+  <a-layout class="app-layout" style="background: var(--color-bg-1)">
     <a-layout-header class="hdr">
       <div class="hdr-in">
         <div class="title-row">
@@ -284,7 +461,7 @@ const saveCfg = async () => {
           <a-spin :size="14" />
           <a-typography-text type="secondary" style="font-size: 12px">{{ analyzeProg.phase }} {{ analyzeProg.done }}/{{ analyzeProg.total }}</a-typography-text>
         </a-space>
-            <a-tag color="gray" size="small">排序游戏 · 待补 {{ counts.all }}</a-tag>
+            <a-tag color="gray" size="small">排序图片 · 待补 {{ counts.all }}</a-tag>
           </a-space>
           <a-space size="small" class="hdr-actions">
             <a-button size="mini" :loading="analyzing" @click="analyze">重新分析</a-button>
@@ -296,17 +473,17 @@ const saveCfg = async () => {
           </a-space>
         </div>
         <a-typography-text type="secondary" class="sub">
-          真实图取自 {{ defaultPrefixLabel || "…" }} 现图 · 候选池 {{ data?.poolCount ?? '—' }} 张 · 向量 {{ embedStatus.vectors }} · 综合分 = 图像 45% + 名字 30% + 文字 25%
+          <template v-if="defaultPrefixLabel">线上现图取自 {{ defaultPrefixLabel }} · </template>
+          候选池 {{ data?.poolCount ?? '—' }} 张 · 向量 {{ embedStatus.vectors }} · 综合分 = 图像 64% + 文字 36%（无文字时归一）
         </a-typography-text>
         <div class="bar">
           <a-radio-group v-model:model-value="filter" type="button" size="small">
             <a-radio value="all">全部 {{ counts.all }}</a-radio>
             <a-radio value="same">同图 {{ counts.same }}</a-radio>
-            <a-radio value="high">可直接采用 {{ counts.high }}</a-radio>
-            <a-radio value="mid">建议目检 {{ counts.mid }}</a-radio>
+            <a-radio value="high">高相似 {{ counts.high }}</a-radio>
+            <a-radio value="mid">中相似 {{ counts.mid }}</a-radio>
             <a-radio value="low">低 {{ counts.low }}</a-radio>
-            <a-radio value="none">无真实图 {{ counts.none }}</a-radio>
-          <a-radio value="pending">计算中 {{ counts.pending }}</a-radio>
+            <a-radio value="pending">计算中 {{ counts.pending }}</a-radio>
             <a-radio value="picked">已选 {{ counts.picked }}</a-radio>
           </a-radio-group>
         <a-input-search
@@ -330,87 +507,91 @@ const saveCfg = async () => {
       </div>
     </a-layout-header>
 
-    <a-layout-content>
+    <a-layout-content class="content">
       <div class="page">
         <a-spin :loading="loading" style="display: block; width: 100%">
-          <a-space direction="vertical" fill style="width: 100%" :size="16">
-            <a-card v-for="g in visible" :key="g.code" class="gcard" :class="[tierOf(g), { picked: !!picks[g.code] }]">
-              <template #title>
-                <div class="card-title">
-                  <a-space size="small">
-                    <a-typography-text bold class="code">{{ g.code }}</a-typography-text>
-                    <a-typography-text type="secondary">{{ g.hall }} · {{ g.name }}</a-typography-text>
-                    <a-tag size="small" :color="tierColor[tierOf(g)]">{{ tierName[tierOf(g)] }}</a-tag>
-                  </a-space>
-                  <a-tag v-if="picks[g.code]" size="small" color="arcoblue" class="picked-tag">
-                    已选 → long/{{ g.code }}.jpg
-                  </a-tag>
-                </div>
-              </template>
-              <a-row :gutter="16">
-                <a-col :span="4" :md="5">
-                  <div class="realcol">
-                    <div class="colhead realhead">真实图 · 线上现图</div>
-                    <div class="thumb real-thumb">
-                      <a-image
-                        v-if="g.hasReal" :src="`/img/real/${g.code}.jpg`" :alt="g.name"
-                        width="100%" height="100%" fit="cover" :preview="true"
-                      />
-                      <a-empty v-else description="缺失" style="padding: 24px 0" />
-                    </div>
-                    <a-typography-text type="secondary" class="path">{{ g.code }}.jpg</a-typography-text>
+          <div v-if="visible.length" class="vlist" :style="{ height: vTotal + 'px' }">
+            <div
+              v-for="row in vRows" :key="row.code" :data-index="row.index" :ref="measureRow"
+              class="vrow" :style="{ transform: `translateY(${row.start}px)` }"
+            >
+              <a-card class="gcard" :class="[tierOf(row.g), { picked: !!picks[row.g.code] }]">
+                <template #title>
+                  <div class="card-title">
+                    <a-space size="small">
+                      <a-typography-text bold class="code">{{ row.g.code }}</a-typography-text>
+                      <a-typography-text v-if="row.g.hall || row.g.name" type="secondary">{{ row.g.hall }} · {{ row.g.name }}</a-typography-text>
+                      <a-tag size="small" :color="tierColor[tierOf(row.g)]">{{ tierName[tierOf(row.g)] }}</a-tag>
+                    </a-space>
+                    <a-tag v-if="picks[row.g.code]" size="small" color="arcoblue" class="picked-tag">
+                      已选 → {{ pathOf(row.g.code) }}
+                    </a-tag>
                   </div>
-                </a-col>
-                <a-col :span="20" :md="19">
-                  <div class="colhead">候选图标 Top {{ g.top.length }} · 点击卡片采用，再点取消</div>
-                  <div v-if="g.pending" class="empty">候选计算中…</div>
-                  <div v-else class="cands">
-                    <div
-                      v-for="(c, k) in g.top" :key="c.file"
-                      class="cand" :class="[candTier(c), { on: picks[g.code] === c.file }]"
-                      @click="toggle(g, c)"
-                    >
-                      <div class="rank-row">
-                        <span class="rank-no">#{{ k + 1 }}</span>
-                        <span class="score" :class="candTier(c)">{{ pct(c.score) }}</span>
-                        <span v-if="c.pixel != null && c.pixel >= SAME" class="same-chip">同图</span>
-                        <span v-if="picks[g.code] === c.file" class="check-chip">✓ 已选</span>
+                </template>
+                <a-row :gutter="16">
+                  <a-col :span="4" :md="5" class="live-col">
+                    <div class="livecol">
+                      <div class="colhead livehead">线上现图</div>
+                      <div class="thumb live-thumb">
+                        <img
+                          v-if="row.g.hasLive" class="live-img" :src="`/img/live/${row.g.code}.jpg`" :alt="row.g.code"
+                          loading="lazy" decoding="async" @click="openPreview(`/img/live/${row.g.code}.jpg`)"
+                        />
+                        <a-empty v-else description="缺失" style="padding: 24px 0" />
                       </div>
-                      <div class="thumb">
-                        <img :src="`/img/cand/${encodeURIComponent(c.file)}`" :alt="c.name" loading="lazy">
-                      </div>
-                      <div class="cand-name">{{ c.group }} · {{ c.name }}</div>
-                      <div class="cand-file">{{ c.file }}</div>
-                      <div class="factors">
-                        <span class="fx" title="图像结构因子">图 {{ c.img.toFixed(2) }}</span>
-                        <span class="fx" :class="{ na: c.text == null }" title="图上文字因子（OCR）">文 {{ f2(c.text) }}</span>
-                        <span class="fx" title="名字因子">名 {{ c.nameSim.toFixed(2) }}</span>
-                      </div>
-                      <div class="corr">{{ c.corr == null ? `clip 余弦 ${c.img.toFixed(2)}` : `结构 corr ${c.corr.toFixed(2)}` }}</div>
+                      <a-typography-text type="secondary" class="path">{{ row.g.code }}.jpg</a-typography-text>
                     </div>
-                  </div>
-                </a-col>
-              </a-row>
-            </a-card>
-            <a-empty v-if="!visible.length && !loading" description="没有符合条件的项目" style="padding: 80px 0" />
-          </a-space>
+                  </a-col>
+                  <a-col :span="20" :md="19">
+                    <div class="colhead">候选图标 Top {{ row.g.top.length }} · 点击卡片采用，再点取消</div>
+                    <div v-if="row.g.pending" class="empty">候选计算中…</div>
+                    <div v-else class="cands">
+                      <div
+                        v-for="(c, k) in row.g.top" :key="c.file"
+                        class="cand" :class="[candTier(c), { on: picks[row.g.code] === c.file }]"
+                        @click="toggle(row.g, c)"
+                      >
+                        <div class="rank-row">
+                          <span class="rank-no">#{{ k + 1 }}</span>
+                          <span class="score" :class="candTier(c)">{{ pct(c.score) }}</span>
+                          <span v-if="c.pixel != null && c.pixel >= SAME" class="same-chip">同图</span>
+                          <span v-if="picks[row.g.code] === c.file" class="check-chip">✓ 已选</span>
+                        </div>
+                        <div class="thumb">
+                          <img :src="`/img/cand/${encodeURIComponent(c.file)}`" :alt="c.name" loading="lazy" decoding="async">
+                        </div>
+                          <div class="cand-file">{{ c.file }}</div>
+                        <div class="factors">
+                          <span class="fx" title="图像结构因子">图 {{ c.img.toFixed(2) }}</span>
+                          <span class="fx" :class="{ na: c.text == null }" title="图上文字因子（OCR）">文 {{ f2(c.text) }}</span>
+                          <span v-if="c.nameSim != null" class="fx" title="名字因子">名 {{ c.nameSim.toFixed(2) }}</span>
+                        </div>
+                        <div class="corr">{{ c.corr == null ? `clip 余弦 ${c.img.toFixed(2)}` : `结构 corr ${c.corr.toFixed(2)}` }}</div>
+                      </div>
+                    </div>
+                  </a-col>
+                </a-row>
+              </a-card>
+            </div>
+          </div>
+          <a-empty v-if="!visible.length && !loading" description="没有符合条件的项目" style="padding: 80px 0" />
         </a-spin>
       </div>
     </a-layout-content>
 
     <a-drawer v-model:visible="cfgOpen" title="工作台配置" :width="620" unmount-on-close :footer="false">
       <a-space direction="vertical" fill style="width: 100%" :size="20">
-        <a-card title="真实图前缀（按顺序尝试，默认优先）" size="small">
+        <a-card title="线上现图前缀（按顺序尝试，默认优先）" size="small">
           <a-space direction="vertical" fill style="width: 100%" :size="6">
-            <div v-for="(p, i) in cfg.realPrefixes" :key="p.url" class="cfg-item">
+            <div v-for="(p, i) in cfg.livePrefixes" :key="p.url" class="cfg-item">
               <div class="cfg-row">
                 <a-radio :model-value="cfg.defaultPrefixIndex === i" @change="cfg.defaultPrefixIndex = i">默认</a-radio>
                 <a-input v-model="p.name" placeholder="别名" size="small" style="width: 130px" allow-clear />
                 <div class="spacer" />
                 <a-space size="mini">
-                  <a-button size="mini" :disabled="i === 0" @click="move(cfg.realPrefixes, i, -1)">↑</a-button>
-                  <a-button size="mini" :disabled="i === cfg.realPrefixes.length - 1" @click="move(cfg.realPrefixes, i, 1)">↓</a-button>
-                  <a-button size="mini" status="danger" :disabled="cfg.realPrefixes.length <= 1" @click="cfg.realPrefixes.splice(i, 1)">删</a-button>
+                  <a-button size="mini" :disabled="i === 0" @click="move(cfg.livePrefixes, i, -1)">↑</a-button>
+                  <a-button size="mini" :disabled="i === cfg.livePrefixes.length - 1" @click="move(cfg.livePrefixes, i, 1)">↓</a-button>
+                  <a-button size="mini" status="danger" @click="cfg.livePrefixes.splice(i, 1)">删</a-button>
                 </a-space>
               </div>
               <a-typography-text class="cfg-text" code :title="p.url">{{ p.url }}</a-typography-text>
@@ -423,23 +604,32 @@ const saveCfg = async () => {
           </a-space>
         </a-card>
 
-        <a-card title="真实图目录" size="small">
+        <a-card title="线上现图路径规则" size="small">
           <a-space direction="vertical" fill style="width: 100%" :size="6">
-            <div v-for="(d, i) in cfg.realDirs" :key="d" class="cfg-item">
+            <a-input v-model="cfg.livePathPattern" placeholder="long/{code}.jpg" allow-clear />
+            <a-typography-text type="secondary" style="font-size: 11px">
+              {code} 会替换为图片编码；用于按前缀远程取线上现图
+            </a-typography-text>
+          </a-space>
+        </a-card>
+
+                <a-card title="线上现图目录" size="small">
+          <a-space direction="vertical" fill style="width: 100%" :size="6">
+            <div v-for="(d, i) in cfg.liveDirs" :key="d" class="cfg-item">
               <div class="cfg-row">
                 <a-typography-text class="cfg-text" code :title="d">{{ d }}</a-typography-text>
                 <a-space size="mini">
-                  <a-button size="mini" :disabled="i === 0" @click="move(cfg.realDirs, i, -1)">↑</a-button>
-                  <a-button size="mini" :disabled="i === cfg.realDirs.length - 1" @click="move(cfg.realDirs, i, 1)">↓</a-button>
-                  <a-button size="mini" status="danger" @click="cfg.realDirs.splice(i, 1)">删</a-button>
+                  <a-button size="mini" :disabled="i === 0" @click="move(cfg.liveDirs, i, -1)">↑</a-button>
+                  <a-button size="mini" :disabled="i === cfg.liveDirs.length - 1" @click="move(cfg.liveDirs, i, 1)">↓</a-button>
+                  <a-button size="mini" status="danger" @click="cfg.liveDirs.splice(i, 1)">删</a-button>
                 </a-space>
               </div>
             </div>
             
               <a-input-group class="cfg-add">
-              <a-input v-model="newReal" placeholder="绝对路径，如 /Users/xxx/图标目录" allow-clear @keydown.enter="addDir(cfg.realDirs, newReal)" />
-              <a-button @click="openFs('realDir')">浏览</a-button>
-              <a-button type="primary" @click="addDir(cfg.realDirs, newReal)">添加目录</a-button>
+              <a-input v-model="newLive" placeholder="绝对路径，如 /Users/xxx/图标目录" allow-clear @keydown.enter="addDir(cfg.liveDirs, newLive)" />
+              <a-button @click="openFs('liveDir')">浏览</a-button>
+              <a-button type="primary" @click="addDir(cfg.liveDirs, newLive)">添加目录</a-button>
             </a-input-group>
           </a-space>
         </a-card>
@@ -468,10 +658,23 @@ const saveCfg = async () => {
         <a-card title="图像向量（CLIP）" size="small">
           <a-space direction="vertical" fill style="width: 100%" :size="8">
             <a-space size="small" wrap>
+              <a-tag :color="modelStatus.modelExists ? 'green' : 'orange'">{{ modelStatus.modelExists ? '模型就绪' : '模型未下载' }}</a-tag>
+              <a-tag v-if="modelStatus.running" color="arcoblue">下载中 {{ (modelPct * 100).toFixed(1) }}%</a-tag>
+            </a-space>
+            <a-progress v-if="modelStatus.running && modelStatus.total > 0" :percent="modelPct" size="small">
+              <template #text="{ percent }">{{ (percent * 100).toFixed(1) }}%</template>
+            </a-progress>
+            <a-input-group class="cfg-add">
+              <a-input v-model="cfg.modelUrl" placeholder="模型下载地址（http/https）" allow-clear />
+              <a-button type="primary" :loading="modelStatus.running" :disabled="modelStatus.running" @click="downloadModel">下载模型</a-button>
+            </a-input-group>
+            <a-space size="small" wrap>
               <a-tag color="arcoblue">向量库 {{ embedStatus.vectors }}</a-tag>
               <a-tag v-if="embedStatus.running" color="orange">本次 {{ embedStatus.done }}/{{ embedStatus.total }}</a-tag>
               <a-tag v-else-if="embedStatus.error" color="red">出错：{{ embedStatus.error }}</a-tag>
-              <a-tag v-else-if="embedStatus.finishedAt" color="green">上次重建完成 {{ embedStatus.done }}/{{ embedStatus.total }}</a-tag>
+              <a-tag v-else-if="embedStatus.updatedAt" color="green">
+                上次重建 {{ fmtTime(embedStatus.updatedAt) }}<template v-if="embedStatus.total > 0"> · {{ embedStatus.done }}/{{ embedStatus.total }}</template>
+              </a-tag>
             </a-space>
             <a-progress
               v-if="embedStatus.running && embedStatus.total > 0"
@@ -480,13 +683,55 @@ const saveCfg = async () => {
               <template #text="{ percent }">{{ (percent * 100).toFixed(2) }}%</template>
             </a-progress>
             <a-space size="small">
-              <a-button size="small" :disabled="embedStatus.running" @click="rebuildVectors(false)">增量重建（新目录/新图）</a-button>
+              <a-button size="small" :disabled="embedStatus.running || !modelStatus.modelExists" @click="rebuildVectors(false)">增量重建</a-button>
               <a-popconfirm content="全量重算所有向量（约 1 分钟）？" @ok="rebuildVectors(true)">
-                <a-button size="small" status="warning" :disabled="embedStatus.running">全量重建</a-button>
+                <a-button size="small" status="warning" :disabled="embedStatus.running || !modelStatus.modelExists">全量重建</a-button>
               </a-popconfirm>
             </a-space>
             <a-typography-text type="secondary" style="font-size: 11px">
-              模型 backend/models/vision_model.onnx · 保存目录/前缀后建议增量重建，向量变更即时影响图像因子排序
+              模型约 336MB，保存在运行期数据目录 · 首次使用先下载；保存目录/前缀后建议增量重建
+            </a-typography-text>
+          </a-space>
+        </a-card>
+
+        <a-card title="图上文字（OCR）" size="small">
+          <a-space direction="vertical" fill style="width: 100%" :size="8">
+            <a-space size="small" wrap>
+              <a-tag :color="ocrModel.modelReady ? 'green' : 'orange'">{{ ocrModel.modelReady ? '模型就绪' : '模型未下载' }}</a-tag>
+              <a-tag v-if="ocrModel.downloading" color="arcoblue">下载中 {{ ocrModel.done }}/{{ ocrModel.total }}</a-tag>
+            </a-space>
+            <a-progress v-if="ocrModel.downloading && ocrModel.total > 0" :percent="ocrModelPct" size="small">
+              <template #text="{ percent }">{{ (percent * 100).toFixed(0) }}%</template>
+            </a-progress>
+            <a-input-group class="cfg-add">
+              <a-select
+                v-model="cfg.ocrModel" :options="ocrModelOptions"
+                placeholder="识别模型（可选择或输入地址）" allow-search allow-create allow-clear
+              />
+              <a-button type="primary" :loading="ocrModel.downloading" :disabled="ocrModel.downloading" @click="downloadOcrModel">下载模型</a-button>
+            </a-input-group>
+            <a-space size="small" wrap>
+              <a-typography-text type="secondary" style="font-size: 11px">
+                <a href="https://github.com/RapidAI/RapidOCR/blob/main/python/rapidocr/default_models.yaml" target="_blank">模型来源</a>
+              </a-typography-text>
+            </a-space>
+            <a-space size="small" wrap>
+              <a-tag color="arcoblue">已识别 {{ ocrStatus.count }} 张</a-tag>
+              <a-tag v-if="ocrStatus.running" color="orange">本次 {{ ocrStatus.done }}/{{ ocrStatus.total }}</a-tag>
+              <a-tag v-else-if="ocrStatus.error" color="red">出错：{{ ocrStatus.error }}</a-tag>
+              <a-tag v-else-if="ocrStatus.updatedAt" color="green">上次识别 {{ fmtTime(ocrStatus.updatedAt) }}</a-tag>
+            </a-space>
+            <a-progress v-if="ocrStatus.running && ocrStatus.total > 0" :percent="ocrPct" size="small">
+              <template #text="{ percent }">{{ (percent * 100).toFixed(1) }}%</template>
+            </a-progress>
+            <a-space size="small">
+              <a-button size="small" :disabled="ocrStatus.running" @click="rebuildOcr(false)">增量识别</a-button>
+              <a-popconfirm content="全量重新识别所有图片（可能较久）？" @ok="rebuildOcr(true)">
+                <a-button size="small" status="warning" :disabled="ocrStatus.running">全量识别</a-button>
+              </a-popconfirm>
+            </a-space>
+            <a-typography-text type="secondary" style="font-size: 11px">
+              PaddleOCR PP-OCRv5（ONNX）· 识别结果用于文字因子
             </a-typography-text>
           </a-space>
         </a-card>
@@ -498,6 +743,15 @@ const saveCfg = async () => {
       </a-space>
     </a-drawer>
   </a-layout>
+
+  <a-modal v-model:visible="previewOpen" :footer="false" :width="720" title="线上现图" unmount-on-close>
+    <div style="display: flex; justify-content: center; align-items: center; min-height: 120px">
+      <img
+        :src="previewSrc" alt=""
+        style="max-width: 100%; max-height: 70vh; width: auto; height: auto; display: block; border-radius: 8px"
+      />
+    </div>
+  </a-modal>
 
   <a-modal v-model:visible="moveOpen" title="点选落盘（重命名 + 转 JPEG + 移动）" :width="640" :mask-closable="false" unmount-on-close>
     <a-space direction="vertical" fill style="width: 100%" :size="12">
@@ -557,8 +811,14 @@ const saveCfg = async () => {
 </template>
 
 <style scoped>
+.app-layout { height: 100vh; overflow: hidden; }
+.content { flex: 1; min-height: 0; overflow-y: auto; scrollbar-color: var(--color-fill-3) transparent; }
+.content::-webkit-scrollbar { width: 10px; }
+.content::-webkit-scrollbar-track { background: transparent; }
+.content::-webkit-scrollbar-thumb { background: var(--color-fill-3); border-radius: 5px; }
+.content::-webkit-scrollbar-thumb:hover { background: var(--color-fill-4); }
 .hdr {
-  position: sticky; top: 0; z-index: 20; height: auto; line-height: 1.5;
+  position: relative; z-index: 20; flex: none; height: auto; line-height: 1.5;
   padding: 14px 24px 12px; border-bottom: 1px solid var(--color-border-2);
   background: var(--color-bg-1);
 }
@@ -568,7 +828,9 @@ const saveCfg = async () => {
 .sub { font-size: 12px; }
 .bar { display: flex; gap: 12px; align-items: center; margin-top: 10px; row-gap: 8px; flex-wrap: wrap; }
 .spacer { flex: 1; }
-.page { max-width: 1720px; margin: 0 auto; padding: 16px 24px 48px; min-height: 40vh; }
+.page { max-width: 1720px; margin: 0 auto; padding: 16px 24px 48px; }
+.vlist { position: relative; width: 100%; }
+.vrow { position: absolute; top: 0; left: 0; width: 100%; box-sizing: border-box; padding-bottom: 16px; }
 
 .gcard { border-radius: 12px; overflow: hidden; }
 .gcard :deep(.arco-card-header) { border-bottom: 1px solid var(--color-border-1); padding: 12px 16px; }
@@ -583,13 +845,17 @@ const saveCfg = async () => {
   border-bottom: 1px solid var(--color-border-1); padding-bottom: 6px; margin-bottom: 10px;
   text-transform: uppercase;
 }
-.realcol {
+.livecol {
   border: 1px solid var(--color-gold-6, #f59e0b); border-radius: 12px; padding: 10px;
-  box-sizing: border-box; background: var(--color-bg-2); display: flex; flex-direction: column; gap: 8px; height: 100%;
+  box-sizing: border-box; background: var(--color-bg-2); display: flex; flex-direction: column; gap: 8px; flex: 1;
   box-shadow: 0 0 0 3px rgba(245, 158, 11, .08);
 }
-.realhead { color: var(--color-gold-6, #f59e0b); border-bottom-color: rgba(245, 158, 11, .3); }
-.real-thumb { border-radius: 8px; overflow: hidden; border: 1px solid rgba(245, 158, 11, .35); }
+.live-col { display: flex; }
+.gcard :deep(.arco-row) { align-items: stretch; }
+.thumb.live-thumb { aspect-ratio: auto; flex: 1; min-height: 0; }
+.live-img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+.livehead { color: var(--color-gold-6, #f59e0b); border-bottom-color: rgba(245, 158, 11, .3); }
+.live-thumb { border-radius: 8px; overflow: hidden; border: 1px solid rgba(245, 158, 11, .35); }
 .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; word-break: break-all; }
 
 
@@ -655,6 +921,8 @@ const saveCfg = async () => {
 .cfg-add { display: flex; width: 100%; margin-top: 2px; align-items: stretch; }
 .cfg-add > .arco-input-wrapper { flex: 1; min-width: 0; height: 32px; }
 .cfg-add > .arco-btn { height: 32px; }
+.cfg-add > .arco-select { flex: 1; min-width: 0; }
+.cfg-add > .arco-select .arco-select-view { height: 32px; }
 .cfg-add-prefix > .arco-input-wrapper:first-child { flex: 0 0 130px; }
 .fs-dir { padding: 7px 14px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--color-border-1); }
 .fs-dir:hover { background: var(--color-fill-2); }
