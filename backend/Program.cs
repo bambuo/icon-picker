@@ -70,7 +70,7 @@ JsonSerializerOptions JsonOpt(bool indented = false) => new()
     Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
 };
 
-// ---------- 线上现图完整路径规则：{code} 替换为游戏编码；用于按前缀远程取图 ----------
+// ---------- 线上现图完整路径规则：{code} 替换为图片编码；用于按前缀远程取图 ----------
 string LivePathOf(string code)
 {
     var pattern = string.IsNullOrWhiteSpace(config.LivePathPattern) ? "long/{code}.jpg" : config.LivePathPattern;
@@ -575,7 +575,7 @@ class Config
     [JsonConverter(typeof(PrefixListConverter))]
     public List<PrefixItem> LivePrefixes { get; set; } = new();
     public int DefaultPrefixIndex { get; set; }
-    // 线上现图完整路径拼接规则，{code} 为游戏编码占位符
+    // 线上现图完整路径拼接规则，{code} 为图片编码占位符
     public string LivePathPattern { get; set; } = "long/{code}.jpg";
     // 模型下载地址（发布包不带模型）
     public string ModelUrl { get; set; } = "";
